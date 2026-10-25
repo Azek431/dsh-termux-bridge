@@ -2,6 +2,31 @@
 
 本项目遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [1.2.3] —— 2026-10-26
+
+### 新增
+
+- `scripts/push-to-github.sh`：一键发布到 GitHub。DSH 跑在 proot 客人里，看不到 Termux 的
+  `~/.config/gh/oauth_token`，客人里的 `gh` 永远是未登录状态；仓库源码在 Android 共享存储上，
+  Termux 与客人看到同一个目录，所以在 Termux 里跑这个脚本即可建仓并推送。脚本负责：
+  前置检查（git/gh/登录态）、`gh auth setup-git`、补 `git safe.directory`、推断 owner、
+  `gh repo create`、`git push`、补 description/homepage/topics（`dsh-plugin` 等 8 个）。
+
+### 修复
+
+- 试运行（stub 掉 `gh`/`git push` 的完整演练）抓到两个真问题并已修：
+  1. **`gh auth login` 不会把 gh 装成 git 的 credential helper**，缺 `gh auth setup-git` 时
+     `gh repo create --push` 与 `git push` 都死在 `could not read Username for 'https://github.com'`；
+  2. 建仓与推送原来耦合在 `gh repo create --push` 一条命令里，推送失败时无法区分是建仓失败还是
+     凭据失败。现拆成 create → push 两步，push 失败直接打印 `gh auth setup-git` 与
+     `gh auth refresh -s repo` 两条修法。
+
+### 文档
+
+- README 新增第 9 节「发布到 GitHub」：为什么这一步必须在 Termux 里做、一条命令、脚本做的七件事、
+  共享存储上 git 的两个坑（dubious ownership / chmod 不生效导致权限位不进 index）。
+- 原「作者」「许可证」两节顺延为第 10、11 节。
+
 ## [1.2.2] —— 2026-10-26
 
 ### 新增

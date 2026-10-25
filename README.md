@@ -17,7 +17,7 @@
 在 Termux 里跑一次启动脚本，auto 就会自动切过去。
 
 - 包名: @local/dsh-termux-bridge
-- 版本: 1.2.2
+- 版本: 1.2.3
 - 作者: **Azek431（艾泽衡）** — Telegram 频道 [@AzekMain](https://t.me/AzekMain) · Azek431@163.com
 - 许可证: GPL-3.0-only（见 LICENSE / NOTICE）
 - 归属: DSHBox（本仓库自研，不含第三方源码）
@@ -229,7 +229,69 @@ smoke.cjs 覆盖：无 agent 时 auto 落 local、local 执行/退出码/超时/
 
 ---
 
-## 9. 作者
+## 9. 发布到 GitHub
+
+**为什么这一步必须在 Termux 里做，不能在 DSH 里做**
+
+DSH 跑在 proot 客人里，它的 `$HOME` 是客人的 `/root`，与 Termux 的
+`/data/data/com.termux/files/home` 是两个互不相通的根文件系统（详见第 1 节）。
+`gh auth login` 把凭据写在 `~/.config/gh/hosts.yml`，所以：
+
+- 在 **Termux** 里登录 → 凭据在 Termux 侧，客人里的 `gh auth status` 依然显示未登录；
+- 在 **DSH** 里登录 → 凭据在客人里，重启或换设备就没了，把 token 写进容器也不卫生。
+
+所以仓库源码放在 Android 共享存储
+（`/storage/emulated/0/编程/DeepSeek-Hermes/插件/dsh-termux-bridge`），
+**两边看到的是同一个目录**，在 Termux 里直接推即可，不需要拷贝。
+
+**一条命令**
+
+```bash
+# 在 Termux 里
+pkg install git gh          # 只需一次
+gh auth login               # 只需一次：GitHub.com → HTTPS → 浏览器授权
+gh auth setup-git           # 只需一次：否则 git push 报 could not read Username
+cd /storage/emulated/0/编程/DeepSeek-Hermes/插件/dsh-termux-bridge
+bash scripts/push-to-github.sh
+```
+
+`scripts/push-to-github.sh` 会做：
+
+1. 检查 `git` / `gh` 是否安装、`gh` 是否已登录（未登录直接给出下一步命令）；
+2. 跑一次 `gh auth setup-git` 把 gh 装成 git 的 credential helper —— **`gh auth login` 并不会做这件事**，
+   少了它 `git push` 会死在 `could not read Username for 'https://github.com'`；
+3. 把仓库目录加进 `git safe.directory` —— 共享存储是 fuse，属主（10246）和 Termux uid 不一致，
+   不加这一条 git 会报 `detected dubious ownership` 并拒绝工作；
+4. owner 不传时用 `gh api user --jq .login` 推断，仓库名取目录名；
+5. 仓库不存在就 `gh repo create --source=. --remote=origin`（**建仓与推送分开**，
+   推送失败时才能准确提示是凭据问题而不是建仓问题），已存在则跳过；
+6. `git push -u origin main`，失败时直接打印 `gh auth setup-git` / `gh auth refresh -s repo` 两条修法；
+7. 补 description、homepage 与 topics（`dsh-plugin` / `dsh` / `deepseek-harness` /
+   `termux` / `android` / `proot` / `bridge` / `remote-exec`）——
+   官方可发现性靠 GitHub topic `dsh-plugin` 加 `package.json` 的 keywords。
+
+参数：
+
+```bash
+bash scripts/push-to-github.sh                       # 全自动
+bash scripts/push-to-github.sh Azek431               # 指定 owner
+bash scripts/push-to-github.sh Azek431 dsh-termux-bridge --private
+```
+
+**共享存储上 git 的两个坑**
+
+| 现象 | 原因 | 处理 |
+|---|---|---|
+| `fatal: detected dubious ownership in repository` | fuse 上目录属主 10246，Termux uid 不同 | `git config --global --add safe.directory '*'`（脚本已代做） |
+| `chmod +x` 后 git 里仍是 100644 | fuse 不支持 chmod，权限位不进 index | `git update-index --chmod=+x <file>`，本仓库已对 5 个脚本如此处理 |
+
+> DSH 侧也装了 `gh`（`/usr/local/bin/gh` 2.46.0，从 Debian deb 里抽出的静态二进制，
+> 因为客人里 `dpkg` 需要 root 而装不上），它只用于**只读查询**（`gh repo view`、`gh api`），
+> 不用于推送 —— 客人里没有、也不该持有凭据。
+
+---
+
+## 10. 作者
 
 **Azek431（艾泽衡）**
 
@@ -249,7 +311,7 @@ smoke.cjs 覆盖：无 agent 时 auto 落 local、local 执行/退出码/超时/
 
 欢迎在 Telegram 频道反馈问题。
 
-## 10. 许可证
+## 11. 许可证
 
 GPL-3.0-only，见 [LICENSE](LICENSE) 与 [plugin/NOTICE](plugin/NOTICE)。
 
