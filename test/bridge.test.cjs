@@ -62,7 +62,12 @@ async function boot (t, overrides) {
   const scriptPath = path.join(dir, 'agent.sh')
   fs.writeFileSync(scriptPath, fetched.body, { mode: 0o755 })
 
-  const child = spawn('bash', [scriptPath], { stdio: ['ignore', 'pipe', 'pipe'] })
+  // MAX_FAIL=1：连不上就自杀。否则 DSH 侧一断，这个 bash 会永远重连下去，
+  // 测试进程被 kill 之后它还活着，下次跑别的用例就能被它混进来。
+  const child = spawn('bash', [scriptPath], {
+    stdio: ['ignore', 'pipe', 'pipe'],
+    env: Object.assign({}, process.env, { DSH_BRIDGE_MAX_FAIL: '1' })
+  })
   t.after(() => { try { child.kill('SIGKILL') } catch {} })
   let stderrLog = ''
   child.stderr.setEncoding('utf8')
@@ -239,6 +244,69 @@ test('令牌不对时被拒且不进入 agents 列表', async (t) => {
   await new Promise((r) => setTimeout(r, 1200))
   assert.strictEqual(bridge.status().agents, 0)
   try { fs.rmSync(dir, { recursive: true, force: true }) } catch {}
+})
+
+// 回归 #1（1.2.1）：E_BAD_TOKEN / E_PROTO_MISMATCH 是不可自愈的拒绝，
+// agent 必须自己退出。1.2.0 之前它对所有 DENY 一律 break 后立刻重连，变成
+// 一个 30 秒一次的无限循环，进程永远留在后台 —— 测试里因此残留过 4 个孤儿 agent。
+test('令牌错时 agent 自己退出，不做无限重连', async (t) => {
+  const { renderAgentScript } = require('../plugin/lib/index.js')
+  const bridge = new Bridge({ port: 20000 + Math.floor(Math.random() * 1000) })
+  bridge.httpHandler = () => null
+  t.after(() => bridge.stop())
+  assert.strictEqual(await bridge.start(), true)
+  const script = renderAgentScript({ host: '127.0.0.1', port: bridge.actualPort, token: 'right-token', name: 'bad' })
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'dsh-bridge-deny-'))
+  const file = path.join(dir, 'agent.sh')
+  fs.writeFileSync(file, script, { mode: 0o755 })
+  // 令牌是错的 → 服务端 DENY E_BAD_TOKEN → agent 必须 FATAL 退出。
+  const child = spawn('bash', [file, '--quiet'], {
+    stdio: ['ignore', 'ignore', 'pipe'],
+    env: Object.assign({}, process.env, { DSH_BRIDGE_TOKEN: 'definitely-wrong' })
+  })
+  t.after(() => { try { child.kill('SIGKILL') } catch {} })
+  const exited = await new Promise((resolve) => {
+    const timer = setTimeout(() => resolve(null), 8000)
+    child.on('exit', (code, signal) => { clearTimeout(timer); resolve({ code, signal }) })
+  })
+  assert.ok(exited, 'agent 收到 E_BAD_TOKEN 后应自己退出，而不是永恒重连')
+  assert.strictEqual(bridge.status().agents, 0)
+  try { fs.rmSync(dir, { recursive: true, force: true }) } catch {}
+})
+
+// 回归 #2（1.2.1）：同一个 Termux 起两份 agent（或上次运行的残留连接还在重连）
+// 不能白占 maxAgents。同名新连接应顶掉旧连接，只留一条。
+test('同名 agent 只保留一条连接', async (t) => {
+  const { bridge, dir } = await boot(t)
+  assert.strictEqual(bridge.status().agents, 1)
+  const firstId = bridge.status().agentList[0].id
+  const { renderAgentScript } = require('../plugin/lib/index.js')
+  const script = renderAgentScript({ host: '127.0.0.1', port: bridge.actualPort, token: bridge.token, name: 'testagent' })
+  const second = path.join(dir, 'agent2.sh')
+  fs.writeFileSync(second, script, { mode: 0o755 })
+  const child = spawn('bash', [second, '--quiet'], {
+    stdio: ['ignore', 'ignore', 'ignore'],
+    env: Object.assign({}, process.env, { DSH_BRIDGE_MAX_FAIL: '1' })
+  })
+  t.after(() => { try { child.kill('SIGKILL') } catch {} })
+  // 判据必须是「id 换了」而不是「个数是 1」：从 2 变回 1 也可能只是旧连接自己断了。
+  await waitFor(() => {
+    const st = bridge.status()
+    return st.agents === 1 && st.agentList[0] && st.agentList[0].id !== firstId
+  }, 8000, '同名新连接顶替旧连接')
+  // 再盯 3 秒，确认没有乒乓：老 agent 收到 BYE 就该退出，不会连回来再把这条顶掉。
+  const seen = new Set()
+  for (let i = 0; i < 12; i += 1) {
+    await new Promise((r) => setTimeout(r, 250))
+    const st = bridge.status()
+    assert.strictEqual(st.agents, 1, '同名 agent 应始终只有一条，实际 ' + st.agents)
+    seen.add(st.agentList[0].id)
+  }
+  assert.strictEqual(seen.size, 1, '3 秒内连接不该被反复顶替（乒乓），出现过的 id: ' + [...seen].join(','))
+  // 去重之后仍然能正常干活
+  const r = await bridge.exec({ script: 'echo still-alive' })
+  assert.strictEqual(r.ok, true, r.stderr)
+  assert.match(r.stdout, /still-alive/)
 })
 
 test('HTTP 面只回 /agent，其它路径 404', async (t) => {

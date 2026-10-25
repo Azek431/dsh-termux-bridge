@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# uninstall.sh — 卸载 termux-bridge（DSH ⇄ Termux 桥接）
+# uninstall.sh — 卸载 dsh-termux-bridge（DSH ⇄ Termux 桥接）
 # 用法: bash uninstall.sh [profile目录]
 #
 # 顺序与安装相反：**先从 bundles 里摘掉这一条**，再删包目录。
@@ -16,11 +16,11 @@ if [ -z "$PROFILE" ] || [ ! -d "$PROFILE" ]; then
   exit 1
 fi
 
-PKG="@local/termux-bridge"
+PKG="@local/dsh-termux-bridge"
 NM="$PROFILE/node_modules"
 PKGJSON="$PROFILE/package.json"
-PKGDIR="$NM/@local/termux-bridge"
-MANIFEST="$PKGDIR/.termux-bridge-install.json"
+PKGDIR="$NM/@local/dsh-termux-bridge"
+MANIFEST="$PKGDIR/.dsh-termux-bridge-install.json"
 PY="$(command -v python3 || true)"
 
 if [ -f "$PKGJSON" ] && [ -n "$PY" ]; then

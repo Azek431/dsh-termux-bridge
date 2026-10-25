@@ -162,11 +162,29 @@ handle_get() {
 }
 
 # ── 主循环：断了就重连，直到被 Ctrl-C ────────────────────────────────────
+# DENY 分两类：认不出的（令牌错、协议不匹配）必须**直接退出**。老版本对所有 DENY
+# 一律 break 然后立刻重连，令牌错时就变成一个 3 秒一次的无限重连循环，进程永远留在
+# 后台 —— 这正是测试里能残留一堆 agent、把后来那次冒烟测试搞脏的原因。
 FIFO_WAIT=90
-while :; do
+FATAL=0
+FAILS=0
+# 重试上限：0 = 无限重试（默认，DSH 重启后 agent 自己会接回去）。
+# 设成 >0 时，连续失败这么多次就退出 —— 测试用它保证 agent 不会变成孤儿进程。
+MAX_FAIL=${DSH_BRIDGE_MAX_FAIL:-0}
+case "$MAX_FAIL" in ''|*[!0-9]*) MAX_FAIL=0 ;; esac
+while [ "$FATAL" = 0 ]; do
   if ! exec 3<>"/dev/tcp/$HOST/$PORT" 2>/dev/null; then
-    say "连不上 $HOST:$PORT，3 秒后重试（DSH 没起或端口不对）"
-    sleep 3
+    FAILS=$(( FAILS + 1 ))
+    if [ "$MAX_FAIL" -gt 0 ] && [ "$FAILS" -ge "$MAX_FAIL" ]; then
+      say "连续 $FAILS 次连不上 $HOST:$PORT，已达上限，退出"
+      exit 1
+    fi
+    # 退避：3,6,12,24,30,30… 秒。固定 3 秒在 DSH 关掉之后会变成一个安静的
+    # 每 3 秒一次的无限空转，谁也注意不到。
+    BACKOFF=$(( 3 << (FAILS - 1) ))
+    [ "$BACKOFF" -gt 30 ] && BACKOFF=30
+    say "连不上 $HOST:$PORT，${BACKOFF} 秒后重试（DSH 没起或端口不对）"
+    sleep "$BACKOFF"
     continue
   fi
   printf 'HELLO 1 %s %s\n' "$(enc "$TOKEN")" "$(enc "$NAME")" >&3
@@ -195,11 +213,30 @@ while :; do
     [ "$tag" != "$line" ] && rest=${line#* }
     case "$tag" in
       WELCOME)
+        FAILS=0
         say "握手成功：$rest"
+        ;;
+      BYE)
+        # 服务端让我们别连了（典型场景：同一个名字的新 agent 已经在跑，我们这个是被顶掉的旧连接）。
+        # 必须直接退出：否则断线后立刻重连，再反过来把新的顶掉，两条连接乒乓对踢。
+        say "被服务端要求断开：$(printf '%s' "$rest" | b64d 2>/dev/null)"
+        FATAL=1
+        break
         ;;
       DENY)
         code=${rest%% *}
         say "被拒绝：$code $(printf '%s' "${rest#* }" | b64d 2>/dev/null)"
+        case "$code" in
+          E_BAD_TOKEN|E_PROTO_MISMATCH)
+            # 重连一万次也不会变好：令牌与协议版本都是脚本里的常量，只能换脚本。
+            say "这个错误重试无用，agent 退出。请回 DSH 里重新执行 termux_bootstrap 拿新启动脚本。"
+            FATAL=1
+            ;;
+          *)
+            say "10 秒后重试"
+            sleep 10
+            ;;
+        esac
         break
         ;;
       PING)

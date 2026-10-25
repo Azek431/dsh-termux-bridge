@@ -6,12 +6,12 @@
 # 与 DSH 客人共享同一网络命名空间，所以 127.0.0.1 是通的，不需要 root、不需要端口映射。
 #
 # 用法（在 Termux 里，复制整行）：
-#   bash ~/storage/shared/编程/DeepSeek-Hermes/插件/termux-bridge/scripts/termux-attach.sh
+#   bash ~/storage/shared/编程/DeepSeek-Hermes/插件/dsh-termux-bridge/scripts/termux-attach.sh
 #   # 或指定名字：bash ... termux-attach.sh my-phone
 #
 # 想常驻（推荐，这样以后都不用管 Termux 有没有在前台）：
 #   termux-wake-lock
-#   nohup bash ~/storage/shared/编程/DeepSeek-Hermes/插件/termux-bridge/scripts/termux-attach.sh \
+#   nohup bash ~/storage/shared/编程/DeepSeek-Hermes/插件/dsh-termux-bridge/scripts/termux-attach.sh \
 #     >> ~/.dsh-bridge.log 2>&1 &
 #
 # 令牌每次 DSH 重启可能变化，所以本脚本不内置令牌，而是每次向桥接端口现拉：

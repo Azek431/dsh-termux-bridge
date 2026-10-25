@@ -327,6 +327,18 @@ class Bridge extends EventEmitter {
     }
     agent.registered = true
     agent.name = proto.decField(fields[2]) || 'termux'
+    // 同名 agent 去重：同一个 Termux 只需要一条连接。旧实例遗留下来的同名连接
+    // （例如 DSH 重启后旧 agent 还在重连、而令牌是配置里写死的固定值）如果不摘掉，
+    // 一个 Termux 会占满 maxAgents，而且 #idleAgent 可能挑到那条半死的连接。
+    for (const other of [...this.agents]) {
+      if (other === agent || !other.registered || other.name !== agent.name) continue
+      // 必须先发 BYE 再断。直接 destroy 的话，对面那个 agent 会立刻重连、然后又反过来
+      // 把这条顶掉，两条连接乒乓对踢，永远不收敛。BYE 是告诉它「别再来了」。
+      this.#send(other, proto.encodeFrame('BYE', [proto.encField('被同名 agent 顶替（可能是上次运行遗留的连接）')]))
+      this.#dropAgent(other, '被同名 agent 顶替（可能是上次运行遗留的连接）')
+      const stale = other.socket
+      setTimeout(() => { try { stale.destroy() } catch {} }, 80)
+    }
     this.agents.add(agent)
     this.#send(agent, proto.encodeFrame('WELCOME', [proto.PROTO_VERSION, proto.encField(os.hostname())]))
     this.emit('agent', agent)

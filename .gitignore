@@ -15,6 +15,7 @@ Thumbs.db
 *.swp
 
 # 安装器运行时留下的所有权清单（每台机器路径不同，不入库）
+.dsh-termux-bridge-install.json
 .termux-bridge-install.json
 mount.json
 

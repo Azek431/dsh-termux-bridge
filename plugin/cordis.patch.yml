@@ -1,7 +1,7 @@
-# Patch layer for @local/termux-bridge.
+# Patch layer for @local/dsh-termux-bridge.
 # 只把本包注册成一个 cordis Loader 条目（id 与 name 都等于包名），形态与
 # @local/mobile-pilot 的 cordis.patch.yml 一致；本包不发布自己的 service。
 # 行为全在 lib/index.js 的 apply 里：起 loopback 监听 + 注册 6 条 termux_* 工具。
 - insert:
-    - id: '@local/termux-bridge'
-      name: '@local/termux-bridge'
+    - id: '@local/dsh-termux-bridge'
+      name: '@local/dsh-termux-bridge'

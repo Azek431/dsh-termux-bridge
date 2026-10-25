@@ -1,7 +1,7 @@
 {
-  "name": "@local/termux-bridge",
+  "name": "@local/dsh-termux-bridge",
   "license": "GPL-3.0-only",
-  "version": "1.1.1",
+  "version": "1.2.1",
   "description": "Termux 桥接插件（双执行面）：DSH 在 PRoot 客人里没有 am/su、和 Termux 也没有共享文件系统，唯一共享的是网络命名空间。本插件在客人里监听 127.0.0.1，由用户在 Termux 里跑一次零依赖 bash agent 连回来即可在 Termux 里执行命令、传文件；没有 agent 连接时 auto 自动降级到客人本地 Debian 执行面，所以不后台挂 Termux 也能干活（termux_status / termux_bootstrap / termux_exec / termux_run / termux_push / termux_pull）",
   "author": {
     "name": "Azek431",

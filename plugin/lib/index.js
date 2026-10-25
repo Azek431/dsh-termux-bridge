@@ -1,6 +1,6 @@
 'use strict'
 /**
- * @local/termux-bridge —— 把 Termux（Android 侧终端）接成 DSH 的一条执行通道。
+ * @local/dsh-termux-bridge —— 把 Termux（Android 侧终端）接成 DSH 的一条执行通道。
  *
  * 存在理由：DSH 跑在 App 的 PRoot 客人里，客人内没有 am / su，拉不起 Termux
  * 进程；两边也没有共享文件系统。唯一共享的东西是网络命名空间（同一个 loopback）。
@@ -597,13 +597,13 @@ function makeHttpHandler (getBridge) {
 
 // ── 插件入口 ────────────────────────────────────────────────────────────
 
-const name = '@local/termux-bridge'
+const name = '@local/dsh-termux-bridge'
 const inject = ['tools']
 
 async function apply (ctx, config) {
   const cfg = config || {}
   if (!ctx || !ctx.tools || typeof ctx.tools.register !== 'function') {
-    process.stderr.write('termux-bridge: 宿主未提供 tools 服务，工具未注册\n')
+    process.stderr.write('dsh-termux-bridge: 宿主未提供 tools 服务，工具未注册\n')
     return
   }
   const bridge = new Bridge({
@@ -616,14 +616,14 @@ async function apply (ctx, config) {
   bridge.httpHandler = makeHttpHandler(() => bridge)
   const started = await bridge.start()
   if (!started) {
-    process.stderr.write('termux-bridge: 监听失败（' + (bridge.lastError || '未知原因') + '），工具仍会注册但不可用\n')
+    process.stderr.write('dsh-termux-bridge: 监听失败（' + (bridge.lastError || '未知原因') + '），工具仍会注册但不可用\n')
   } else if (ctx.logger) {
-    try { ctx.logger.info('termux-bridge listening on ' + bridge.host + ':' + bridge.actualPort) } catch {}
+    try { ctx.logger.info('dsh-termux-bridge listening on ' + bridge.host + ':' + bridge.actualPort) } catch {}
   }
 
   // 监听器与定时器都由 ctx.effect 托管：插件卸载时自动关闭，不留孤儿。
   if (typeof ctx.effect === 'function') {
-    ctx.effect(() => () => bridge.stop(), 'termux-bridge: listener')
+    ctx.effect(() => () => bridge.stop(), 'dsh-termux-bridge: listener')
   } else if (typeof ctx.on === 'function') {
     ctx.on('dispose', () => bridge.stop())
   }
@@ -632,7 +632,7 @@ async function apply (ctx, config) {
   if (!acquired.defineTool) {
     const viaImport = await importDefineTool(acquired.resolvedPaths)
     if (!viaImport) {
-      process.stderr.write('termux-bridge: ' + DSH_TOOLS_MISSING + '\n')
+      process.stderr.write('dsh-termux-bridge: ' + DSH_TOOLS_MISSING + '\n')
       return
     }
     acquired.defineTool = viaImport
@@ -645,7 +645,7 @@ async function apply (ctx, config) {
       ctx.tools.register(tool)
       registered.push(tool.name)
     } catch (err) {
-      process.stderr.write('termux-bridge: PARTIAL_REGISTRATION registered=[' + registered.join(',') + '] failed=' +
+      process.stderr.write('dsh-termux-bridge: PARTIAL_REGISTRATION registered=[' + registered.join(',') + '] failed=' +
         (tool && tool.name) + ' (' + ((err && err.message) || err) + ')\n')
       break
     }

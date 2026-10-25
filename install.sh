@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
-# install.sh — termux-bridge（DSH ⇄ Termux 桥接）一键装配脚本
+# install.sh — dsh-termux-bridge（DSH ⇄ Termux 桥接）一键装配脚本
 # 用法: bash install.sh [profile目录] [--port <端口>]
 #   默认 profile: $DSH_HOME/profiles/web / /workspace/.dsh/profiles/web / /root/projects/.dsh/profiles/web 依次探测
 #   默认端口: 8791（插件内 DEFAULT_PORT；这里只把它写进 install.json 备查，不改插件行为）
 #
 # 与 mobile-pilot / dsh-mobile-adapt 的 install.sh 同形：把 plugin/ 复制进 profile 的
-# node_modules/@local/termux-bridge，再把它注册进 profile 的 dsh.profile.bundles。
+# node_modules/@local/dsh-termux-bridge，再把它注册进 profile 的 dsh.profile.bundles。
 # 这个包不像 mobile-pilot 那样需要信箱挂载点（它不依赖宿主绑进来的目录），也
 # 不需要 node_modules/.bin 命令入口（它的对外形态是 6 个 termux_* 工具 + 一条回环 TCP），
 # 所以第 5 步改成写一份 install 元数据，不建命令链接。
@@ -46,7 +46,7 @@ if [ -z "$PROFILE" ] || [ ! -d "$PROFILE" ]; then
   exit 1
 fi
 
-PKG="@local/termux-bridge"
+PKG="@local/dsh-termux-bridge"
 SRC="$(cd "$(dirname "$0")" && pwd)/plugin"
 NM="$PROFILE/node_modules"
 PKGJSON="$PROFILE/package.json"
@@ -77,7 +77,7 @@ PYEOF
 
 # --- 0.5) 自愈上次异常退出留下的残留 ---
 if [ ! -e "$NM/$PKG" ]; then
-  for residue in "$NM/@local"/.termux-bridge-backup.*; do
+  for residue in "$NM/@local"/.dsh-termux-bridge-backup.*; do
     [ -e "$residue" ] || continue
     echo "! 活跃包缺失但发现上次遗留的备份 $residue，先复位到活跃位"
     if mv "$residue" "$NM/$PKG"; then
@@ -89,8 +89,8 @@ if [ ! -e "$NM/$PKG" ]; then
 fi
 
 # --- 事务骨架：阶段目录 → 校验 → 备份 → 替换 → 失败回滚 ---
-STAGE="$NM/@local/.termux-bridge-stage.$$"
-BACKUP="$NM/@local/.termux-bridge-backup.$$"
+STAGE="$NM/@local/.dsh-termux-bridge-stage.$$"
+BACKUP="$NM/@local/.dsh-termux-bridge-backup.$$"
 if [ -e "$STAGE" ]; then
   STAGE="$STAGE.retry"
   if [ -e "$STAGE" ]; then
@@ -220,14 +220,14 @@ PYEOF
 
 # --- 5) 所有权清单：卸载只删这里登记过的东西 ---
 echo "==> 写所有权清单"
-"$PY" - "$NM/$PKG/.termux-bridge-install.json" "$PORT_HINT" $REQUIRED << 'PYEOF'
+"$PY" - "$NM/$PKG/.dsh-termux-bridge-install.json" "$PORT_HINT" $REQUIRED << 'PYEOF'
 import json, os, sys, tempfile, time
 try: sys.stdout.reconfigure(encoding="utf-8")
 except Exception: pass
 target, port = sys.argv[1], sys.argv[2]
 files = sys.argv[3:]
 payload = {
-    'package': '@local/termux-bridge',
+    'package': '@local/dsh-termux-bridge',
     'files': files,
     'portHint': int(port) if str(port).isdigit() else port,
     'installedAtWall': int(time.time()),
@@ -239,7 +239,7 @@ os.replace(tmp, target)
 PYEOF
 
 echo
-echo "+ termux-bridge 装配完成。请重启 dsh 生效。"
+echo "+ dsh-termux-bridge 装配完成。请重启 dsh 生效。"
 echo "+ 重启后 agent 的工具列表里会多出 6 个工具：termux_status / termux_bootstrap / termux_exec /"
 echo "  termux_run / termux_push / termux_pull。"
 echo "+ 下一步：termux_status 会把在 Termux 里安装 agent 的命令打出来；拿到命令去 Termux 里跑，"

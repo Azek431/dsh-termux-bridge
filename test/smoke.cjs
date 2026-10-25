@@ -6,8 +6,14 @@ const http = require('node:http')
 const { spawn } = require('node:child_process')
 const fs = require('node:fs')
 
-const PKG = process.env.SMOKE_PKG || '/root/projects/.dsh/profiles/web/node_modules/@local/termux-bridge'
+const PKG = process.env.SMOKE_PKG || '/root/projects/.dsh/profiles/web/node_modules/@local/dsh-termux-bridge'
 const mod = require(PKG)
+
+// 端口与令牌都必须随机：固定端口 + 固定令牌会让上一次跑崩后残留的 agent（它带着
+// 同一个令牌、一直在重连同一个端口）悄悄接进这一次，把「没有 agent」的断言打假。
+const PORT = 20000 + Math.floor(Math.random() * 20000)
+const TOKEN = require('node:crypto').randomBytes(8).toString('hex')
+console.log('port =', PORT, '| token =', TOKEN.slice(0, 4) + '…')
 console.log('name =', mod.name, '| inject =', JSON.stringify(mod.inject), '| Config =', typeof mod.Config)
 
 const registered = []
@@ -26,7 +32,7 @@ const cleanup = () => {
 }
 
 ;(async () => {
-  await mod.apply(ctx, { port: 18791, token: 'smoketoken', timeoutMs: 20000 })
+  await mod.apply(ctx, { port: PORT, token: TOKEN, timeoutMs: 20000 })
   console.log('registered =', registered.length, registered.map(t => t.name).join(', '))
   if (registered.length !== 6) throw new Error('expected 6 tools, got ' + registered.length)
   const byName = Object.fromEntries(registered.map(t => [t.name, t]))
@@ -73,7 +79,7 @@ const cleanup = () => {
 
   // ── 2. HTTP 面：/agent 能拿到渲染后的脚本 ──
   const fetchText = (p) => new Promise((resolve, reject) => {
-    http.get({ host: '127.0.0.1', port: 18791, path: p }, (res) => {
+    http.get({ host: '127.0.0.1', port: PORT, path: p }, (res) => {
       let b = ''; res.setEncoding('utf8')
       res.on('data', (c) => { b += c })
       res.on('end', () => resolve({ status: res.statusCode, body: b }))
@@ -83,7 +89,7 @@ const cleanup = () => {
   console.log('/agent status =', agent.status, 'bytes =', agent.body.length)
   if (agent.status !== 200) throw new Error('bad /agent status')
   if (agent.body.includes('__DSH_PORT__')) throw new Error('占位符未替换')
-  if (!agent.body.includes('smoketoken')) throw new Error('令牌未注入')
+  if (!agent.body.includes(TOKEN)) throw new Error('令牌未注入')
   const nf = await fetchText('/nope')
   console.log('/nope status =', nf.status)
   if (nf.status !== 404) throw new Error('404 面坏了')
@@ -91,7 +97,12 @@ const cleanup = () => {
   // ── 3. 起 agent（模拟 Termux 侧）：auto 必须切到 termux ──
   const scriptPath = '/tmp/smoke-agent.sh'
   fs.writeFileSync(scriptPath, agent.body, { mode: 0o755 })
-  child = spawn('bash', [scriptPath, '--quiet'], { stdio: ['ignore', 'ignore', 'pipe'], detached: true })
+  // DSH_BRIDGE_MAX_FAIL=1：连不上就退出，别变成永远重连的孤儿进程。
+  child = spawn('bash', [scriptPath, '--quiet'], {
+    stdio: ['ignore', 'ignore', 'pipe'],
+    detached: true,
+    env: Object.assign({}, process.env, { DSH_BRIDGE_MAX_FAIL: '1', DSH_BRIDGE_TOKEN: TOKEN, DSH_BRIDGE_PORT: String(PORT) })
+  })
   child.stderr.on('data', (d) => process.stderr.write('[agent] ' + d))
   await new Promise((r) => setTimeout(r, 1500))
 

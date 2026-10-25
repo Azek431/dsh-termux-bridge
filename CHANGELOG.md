@@ -2,6 +2,59 @@
 
 本项目遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [1.2.1] —— 2026-10-26
+
+### 修复（都是 agent 侧的生命周期缺陷，跟协议无关）
+
+- **令牌错时 agent 变成无限重连的僵尸进程**。老实现对**所有** `DENY` 都是 `break` 后
+  立刻重连，而 `E_BAD_TOKEN` / `E_PROTO_MISMATCH` 这类拒绝重连一万次也不会变好 ——
+  结果是每 3 秒一次的重连循环，进程永远留在后台，谁都看不见。
+  症状：跑几轮测试后 `ps` 里躺着四五个 `bash .../agent.sh`，最老的一个已经挂了 2h41m。
+  修法：`DENY` 按 code 分流 —— 令牌错/协议不匹配 = `FATAL=1` 直接退出；其它
+  （`E_TOO_MANY_AGENTS` 等可自愈的）退避 10 秒再试。
+- **连不上时退避与上限**。原来是固定 `sleep 3` 无限重试。改成指数退避
+  （3,6,12,24,30,30…，封顶 30 秒），并新增 `DSH_BRIDGE_MAX_FAIL`：设成 >0 时连续失败
+  该次数就退出（默认 0 = 无限重试，保持「DSH 重启后 agent 自己接回去」的既有行为）。
+  测试用它保证 agent 不会变成孤儿进程。
+- **同名 agent 去重（服务端）**。同一个 Termux 起两份 agent，或上次运行的残留连接还在
+  重连时，会白占 `maxAgents`，且 `#idleAgent()` 可能挑到那条半死的连接。新连接用同名
+  注册时顶掉旧的。
+  **这里踩了一个坑**：第一版直接 `socket.destroy()`，被顶掉的那个立刻重连、又反过来把
+  新的顶掉 —— 两条连接乒乓对踢永不收敛，测试因此挂死 2 分钟。正解是先发 `BYE` 帧再断，
+  agent 收到 `BYE` 视为致命并退出。
+
+### 测试
+
+- `test/smoke.cjs` 与 `test/bridge.test.cjs` 改用**随机端口 + 随机令牌**。原来冒烟用固定
+  `18791` + 固定 `smoketoken`，上一轮跑崩残留的 agent 带着同一个令牌会自动接进下一轮，
+  把「没有 agent」的断言打成假的 —— 这就是那次「冒烟测试莫名其妙失败、代码根本没改」
+  的真正原因。
+- 新增 2 条回归用例（令牌错时 agent 自己退出、同名 agent 只保留一条且 3 秒内不乒乓）。
+  用例总数 18 → 20。
+
+## [1.2.0] —— 2026-10-26
+
+### 变更（破坏性：包名与仓库名）
+
+- **包名 `@local/termux-bridge` → `@local/dsh-termux-bridge`，仓库名 `termux-bridge` → `dsh-termux-bridge`**。
+  原因：DSH 官方插件约定包名与仓库名都取 `dsh-<能力>` 形态（见 dsh-plugin-guide 的
+  `guide/release-engineering.zh-CN.md` 第 1 节「能扩展的布局与命名」），这样在 GitHub 上
+  靠 topic `dsh-plugin` + package keywords 才可发现。旧名是 `@local/` 私有形态，不符合约定。
+- 随之改动的内部标识：`dsh.profile.bundles` 条目、`cordis.patch.yml` 的 id/name、
+  阶段目录与备份位前缀（`.dsh-termux-bridge-{stage,backup}.*`）、所有权清单
+  `.dsh-termux-bridge-install.json`、日志前缀 `dsh-termux-bridge:`。
+- **保持不变（有意为之）**：`plugin/agent/termux-bridge-agent.sh` 文件名、工具名
+  `termux_*`、协议与端口。改名脚本名会让用户 Termux 侧已装好的 agent 失联，
+  而工具名是模型看到的面，改名没有收益只有风险。
+
+### 升级注意
+
+- 这是重命名，不是原地升级：先跑旧 `uninstall.sh`（或手工从 profile 的
+  `dsh.profile.bundles` 摘掉 `@local/termux-bridge` 并删
+  `node_modules/@local/termux-bridge`），再跑新 `install.sh`。两个包同时注册会让
+  `termux_*` 工具重复注册。装完重启 dsh。
+
+
 ## [1.1.1] —— 2026-10-25
 
 ### 修复

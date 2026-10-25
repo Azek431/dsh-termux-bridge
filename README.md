@@ -1,4 +1,4 @@
-# termux-bridge —— DSH ⇄ Termux 桥接插件
+# dsh-termux-bridge —— DSH ⇄ Termux 桥接插件
 
 [![](https://img.shields.io/badge/powered_by-dsh-4D6BFE?style=flat-square&logo=deepseek&logoColor=white)](https://github.com/deepseek-ai/deepseek-harness)
 
@@ -16,8 +16,8 @@
 所以「不想把 Termux 挂后台」时照样能执行命令、装包、编译；「想用 Termux 的环境」时
 在 Termux 里跑一次启动脚本，auto 就会自动切过去。
 
-- 包名: @local/termux-bridge
-- 版本: 1.1.1
+- 包名: @local/dsh-termux-bridge
+- 版本: 1.2.1
 - 作者: **Azek431（艾泽衡）** — Telegram 频道 [@AzekMain](https://t.me/AzekMain) · Azek431@163.com
 - 许可证: GPL-3.0-only（见 LICENSE / NOTICE）
 - 归属: DSHBox（本仓库自研，不含第三方源码）
@@ -64,11 +64,11 @@ DSH 跑在 App 的 **PRoot 客人**里。这个客人：
 install.sh 的事务顺序（照抄 mobile-pilot 的骨架）：
 
 1. 预检：python3 在不在、必需文件齐不齐、profile 的 dsh.profile.bundles 是不是 list；
-2. 复制到阶段目录 node_modules/@local/.termux-bridge-stage.<pid>，在阶段目录上跑
+2. 复制到阶段目录 node_modules/@local/.dsh-termux-bridge-stage.<pid>，在阶段目录上跑
    node --check（四个 JS）与 bash -n（agent 脚本）以及文件清单核对；
 3. 旧包整体挪进备份位 → 新包改名上位 → 发布后复检清单；
-4. 往 dsh.profile.bundles 追加 @local/termux-bridge（临时文件 + 原子改名）；
-5. 写 .termux-bridge-install.json 所有权清单。
+4. 往 dsh.profile.bundles 追加 @local/dsh-termux-bridge（临时文件 + 原子改名）；
+5. 写 .dsh-termux-bridge-install.json 所有权清单。
 
 任一步失败：首装则撤半包 + 摘 bundle 条目；升级则把旧包放回原位（旧版保持可用）。
 **这条链路不是原子操作，重装/升级前先停 dsh。**
@@ -175,7 +175,7 @@ local 执行面不走这个协议：它是进程内调用 lib/local.js，直接 
 
 | 现象 | 查这里 |
 |---|---|
-| 工具一条都不出现 | dsh 没重启；或 node_modules/@local/termux-bridge 不在；启动日志里找 termux-bridge: 前缀 |
+| 工具一条都不出现 | dsh 没重启；或 node_modules/@local/dsh-termux-bridge 不在；启动日志里找 dsh-termux-bridge: 前缀 |
 | termux_status 说未启动 | 端口全被占（看 lastError）；换成空闲端口重装 |
 | 命令报 E_NO_AGENT | 你把 backend 显式写成了 termux 但没连 agent。要么去掉 backend（auto 会走本地），要么在 Termux 里跑启动脚本 |
 | 命令在客人本地跑了但你要 Termux | termux_status 看 activeBackend；需要 Termux 就起 agent，或显式 backend: "termux" |
@@ -190,7 +190,7 @@ agent 侧有 --quiet 参数可关掉 stderr 日志。
 
 ## 8. 测试
 
-    node --test test/bridge.test.cjs     # 18 条：协议 / 执行 / push-pull / 超时语义 / 大输出 / HTTP 面
+    node --test test/bridge.test.cjs     # 20 条：协议 / 执行 / push-pull / 超时语义 / 大输出 / agent 生命周期 / HTTP 面
     node test/smoke.cjs                  # 冒烟：真加载 profile 里的包，两个执行面各跑一遍
 
 注意 node --test 跑完可能不退出（定时器未 unref），后台跑再 tail 日志，别前台等。
@@ -198,7 +198,15 @@ agent 侧有 --quiet 参数可关掉 stderr 日志。
 bridge.test.cjs 覆盖：握手执行、非零退出码透传、多行/heredoc、cwd、cwd 不存在（exit 97）、
 argv 空格与 $(echo pwn) 不被二次展开、输出截断、超时强杀、命令自己 exit 124 不算超时、
 掉线报错、多片 push/pull 往返、远端建目录、pull 缺失文件、无 agent、错令牌、HTTP 路由、
-**大输出（1 MiB）不被帧上限撕掉连接**、**pull 大文件不被帧上限撕掉连接**（后两条是 1.1.1 的回归）。
+**大输出（1 MiB）不被帧上限撕掉连接**、**pull 大文件不被帧上限撕掉连接**（后两条是 1.1.1 的回归）、
+**令牌错时 agent 自己退出而不是无限重连**、**同名 agent 只保留一条且 3 秒内不乒乓**（后两条 1.2.1）。
+
+两条与"环境隔离"有关的约定，改测试时别弄丢：
+
+- **端口与令牌必须随机**。原来固定 18791 + 固定 `smoketoken`，上一轮跑崩残留的孤儿
+  agent 带着同一个令牌会自动接进下一轮，把"起手 0 个 agent"断言打成假的。
+- **spawn 出来的 agent 必须带 `DSH_BRIDGE_MAX_FAIL=1`**，让它连不上就自杀，
+  否则测试进程被 kill 之后它还在后台重连，几小时后还能污染别的用例。
 
 smoke.cjs 覆盖：无 agent 时 auto 落 local、local 执行/退出码/超时/cwd 缺失/push-pull、
 强制 termux 无 agent 报 E_NO_AGENT、非法 backend 报 E_INVALID_ARGUMENT、
@@ -218,7 +226,9 @@ smoke.cjs 覆盖：无 agent 时 auto 落 local、local 执行/退出码/超时/
 
 | 文档 | 内容 |
 |---|---|
-| 04-研究报告/termux-bridge-全面实测报告.md | 环境、工具链、两执行面 31 项实测数据 + 18 条自动化用例 |
+| 04-研究报告/termux-bridge-全面实测报告.md | 环境、工具链、两执行面 31 项实测数据 + 20 条自动化用例 |
+| 03-技术笔记/DSH插件命名规范.md | 仓库名=包名=dsh-<能力>；改名 6 步清单；「不该跟着改」清单 |
+| 03-技术笔记/termux-bridge-机制与踩坑.md 第 10 节 | agent 生命周期三坑：DENY 分类、退避上限、同名去重为什么要发 BYE |
 | 04-研究报告/termux-bridge-经验总汇总.md | 否证优先的方法论、架构决策理由、6 个坑、排障手册 |
 | 03-技术笔记/termux-bridge-机制与踩坑.md | 反向连接为何必须、协议选型、各坑的排错特征 |
 
