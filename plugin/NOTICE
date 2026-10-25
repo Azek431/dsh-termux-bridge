@@ -1,0 +1,15 @@
+@local/termux-bridge
+Copyright (c) 2026 DSHBox user work
+SPDX-License-Identifier: GPL-3.0-only
+
+This plugin is licensed under the GNU General Public License, version 3 only.
+The complete license is in LICENSE beside this file.
+
+termux-bridge 是一个纯本仓库自研的 DSH 插件：它在 DSH 进程里起一条
+127.0.0.1 回环 TCP 监听，把 termux_* 工具调用编码成行帧发给用户在 Termux
+里手动启动的 bash agent，再把 agent 回传的结果解回工具返回值。
+
+依赖与外部组件各自保留自己的许可证：
+  - DeepSeek Harness (@deepseek-ai/dsh-*) —— 由 DSH 运行时提供，不在本包内分发。
+  - Termux（com.termux）—— 用户设备上另行安装，不在本包内分发。
+  - 本包不含 Shizuku、不含 DSHBox pilot 适配层、不含任何 GPL 之外的第三方代码。

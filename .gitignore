@@ -1,0 +1,26 @@
+# 运行时产物
+node_modules/
+*.log
+*.tmp
+
+# 测试临时目录（测试会在 mktemp 里跑，正常不会落在这里，防一手）
+/tmp/
+.test-tmp/
+
+# 编辑器 / 系统
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+
+# 安装器运行时留下的所有权清单（每台机器路径不同，不入库）
+.termux-bridge-install.json
+mount.json
+
+# 本地私钥 / 令牌，永不入库
+*.pem
+*.key
+.credentials*
+.env
+.env.*
