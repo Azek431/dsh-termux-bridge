@@ -1,5 +1,8 @@
 # termux-bridge —— DSH ⇄ Termux 桥接插件
 
+[![](https://img.shields.io/badge/powered_by-dsh-4D6BFE?style=flat-square&logo=deepseek&logoColor=white)](https://github.com/deepseek-ai/deepseek-harness)
+
+
 把手机上的 **Termux** 接成 DSH 的一条执行通道：模型可以在插件注册的 termux_* 工具里
 跑 pkg install、访问 ~/storage、用 Termux 完整的 Linux 工具链。
 
@@ -15,6 +18,7 @@
 
 - 包名: @local/termux-bridge
 - 版本: 1.1.1
+- 作者: **Azek431（艾泽衡）** — Telegram 频道 [@AzekMain](https://t.me/AzekMain) · Azek431@163.com
 - 许可证: GPL-3.0-only（见 LICENSE / NOTICE）
 - 归属: DSHBox（本仓库自研，不含第三方源码）
 - 变更历史: 见 [CHANGELOG.md](CHANGELOG.md)
@@ -186,15 +190,44 @@ agent 侧有 --quiet 参数可关掉 stderr 日志。
 
 ## 8. 测试
 
-    node --test test/bridge.test.cjs     # 16 条：协议 / 执行 / push-pull / 超时语义 / HTTP 面
+    node --test test/bridge.test.cjs     # 18 条：协议 / 执行 / push-pull / 超时语义 / 大输出 / HTTP 面
     node test/smoke.cjs                  # 冒烟：真加载 profile 里的包，两个执行面各跑一遍
 
 注意 node --test 跑完可能不退出（定时器未 unref），后台跑再 tail 日志，别前台等。
 
 bridge.test.cjs 覆盖：握手执行、非零退出码透传、多行/heredoc、cwd、cwd 不存在（exit 97）、
 argv 空格与 $(echo pwn) 不被二次展开、输出截断、超时强杀、命令自己 exit 124 不算超时、
-掉线报错、多片 push/pull 往返、远端建目录、pull 缺失文件、无 agent、错令牌、HTTP 路由。
+掉线报错、多片 push/pull 往返、远端建目录、pull 缺失文件、无 agent、错令牌、HTTP 路由、
+**大输出（1 MiB）不被帧上限撕掉连接**、**pull 大文件不被帧上限撕掉连接**（后两条是 1.1.1 的回归）。
 
 smoke.cjs 覆盖：无 agent 时 auto 落 local、local 执行/退出码/超时/cwd 缺失/push-pull、
 强制 termux 无 agent 报 E_NO_AGENT、非法 backend 报 E_INVALID_ARGUMENT、
 起 agent 后 auto 切 termux、termux 侧执行与 push-pull、有 agent 时强制 local 仍生效。
+
+---
+
+## 9. 作者
+
+**Azek431（艾泽衡）**
+
+- Telegram 频道：[@AzekMain](https://t.me/AzekMain)
+- 邮箱：Azek431@163.com
+
+本项目由作者在 Android（DSHBox / PRoot 客人）环境下实测开发，
+所有 "能不能用" 的结论都有对应实测记录，见配套文档库：
+
+| 文档 | 内容 |
+|---|---|
+| 04-研究报告/termux-bridge-全面实测报告.md | 环境、工具链、两执行面 31 项实测数据 + 18 条自动化用例 |
+| 04-研究报告/termux-bridge-经验总汇总.md | 否证优先的方法论、架构决策理由、6 个坑、排障手册 |
+| 03-技术笔记/termux-bridge-机制与踩坑.md | 反向连接为何必须、协议选型、各坑的排错特征 |
+
+欢迎在 Telegram 频道反馈问题。
+
+## 10. 许可证
+
+GPL-3.0-only，见 [LICENSE](LICENSE) 与 [plugin/NOTICE](plugin/NOTICE)。
+
+本仓库为原创实现，不含第三方源码。运行时只依赖 Node.js 内置模块
+（`net` / `crypto` / `child_process` / `fs` / `os` / `path` / `events`），
+Termux 侧 agent 只依赖 bash 内建 + `base64` / `date` / `mktemp`。
