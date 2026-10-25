@@ -278,6 +278,43 @@ bash scripts/push-to-github.sh Azek431               # 指定 owner
 bash scripts/push-to-github.sh Azek431 dsh-termux-bridge --private
 ```
 
+**`gh auth login` 卡住不动？先查死代理**
+
+设备上常见"apt 里配了 `127.0.0.1:2080`、但代理程序没起来"。这种**死代理**会让 `gh` / `git` 在联网那一步
+**无声挂住**——不报错，只是不动，最难查。典型现场：`gh auth login` 选完
+"+Authenticate Git with your GitHub credentials? Yes" 之后就再也不动了（它正卡在拉 device code 那一步）。
+
+`push-to-github.sh` 现在会先探一遍代理端口，探到死端口直接停下并打印修法。手动排查：
+
+```bash
+# 1) 看有没有代理变量
+env | grep -i proxy
+# 2) 探端口活没活（2080/7890/10809 是你可能用的那几个）
+for p in 2080 7890 7891 10809; do timeout 1 bash -c "echo > /dev/tcp/127.0.0.1/$p" 2>/dev/null && echo "$p OPEN" || echo "$p closed"; done
+# 3) 直连 GitHub 本身通不通
+curl -s -o /dev/null -w "%{http_code}\n" --max-time 10 https://github.com
+```
+
+若第 3 步返回 `200` 而 `gh` 卡住，就是代理的锅。修法：
+
+```bash
+unset http_proxy https_proxy all_proxy HTTP_PROXY HTTPS_PROXY ALL_PROXY
+git config --global --unset http.proxy     # 若有
+export GIT_TERMINAL_PROMPT=1               # 让 git 需要凭据时直接问，而不是干等
+gh auth login
+```
+
+注：`gh auth setup-git` 之后 git 用 gh 的凭据，`GIT_TERMINAL_PROMPT` 主要影响没用 helper 时的兜底行为。
+
+**兜底：完全不想折腾浏览器授权，就用 token**
+
+```bash
+# 在 GitHub 网页 Settings → Developer settings → Personal access tokens 建一个带 repo scope 的 token
+echo "<你的token>" | gh auth login --with-token --hostname github.com
+gh auth setup-git
+```
+
+
 **共享存储上 git 的两个坑**
 
 | 现象 | 原因 | 处理 |

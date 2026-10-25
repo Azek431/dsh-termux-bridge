@@ -20,9 +20,61 @@ VISIBILITY="${3:---public}"
 say() { printf '\033[36m[push]\033[0m %s\n' "$*"; }
 die() { printf '\033[31m[push] 失败:\033[0m %s\n' "$*" >&2; exit 1; }
 
+# 本地代理端口是否真的在监听。设备上常见"apt 里配了 127.0.0.1:2080、但代理程序没起来"，
+# 这种死代理会让 gh / git 在联网那一步无声挂住（不报错，只是不动），最难查。
+probe_port() {
+  local host="$1" port="$2"
+  (exec 3<>"/dev/tcp/$host/$port") >/dev/null 2>&1 && return 0
+  return 1
+}
+
+check_proxy() {
+  local bad=0
+  local vars="http_proxy https_proxy all_proxy HTTP_PROXY HTTPS_PROXY ALL_PROXY"
+  for v in $vars; do
+    local val="${!v:-}"
+    [ -n "$val" ] || continue
+    local hp="${val#*://}"
+    hp="${hp%%/*}"
+    local h="${hp%%:*}" p="${hp##*:}"
+    case "$val" in *://*) ;; *) h="$hp"; p=80 ;; esac
+    [ -n "$p" ] || p=80
+    if probe_port "$h" "$p"; then
+      say "检测到代理 $v=$val（端口在监听，可用）"
+    else
+      printf '\033[33m[push] 警告:\033[0m %s=%s 指向的端口没有程序在监听，gh/git 会卡在这里不报错\n' "$v" "$val" >&2
+      bad=1
+    fi
+  done
+  local gp
+  gp="$(git config --global --get http.proxy 2>/dev/null || true)"
+  if [ -n "$gp" ]; then
+    local hp="${gp#*://}" h="${hp%%:*}" p="${hp##*:}"
+    if ! probe_port "$h" "$p"; then
+      printf '\033[33m[push] 警告:\033[0m git http.proxy=%s 的端口没在监听\n' "$gp" >&2
+      bad=1
+    fi
+  fi
+  if [ "$bad" = 1 ]; then
+    cat >&2 <<'EOF'
+
+  修法（任选）:
+    1) 让代理程序起来，再重跑本脚本；
+    2) 或者在当前 shell 里先清掉代理再跑:
+         unset http_proxy https_proxy all_proxy HTTP_PROXY HTTPS_PROXY ALL_PROXY
+         git config --global --unset http.proxy   # 若有
+         ./scripts/push-to-github.sh
+EOF
+    die "存在指向死端口的代理配置，先处理上面的提示"
+  fi
+}
+
 # --- 0. 前置检查 ---------------------------------------------------------
 command -v git >/dev/null 2>&1 || die "没有 git。Termux 里先跑: pkg install git"
 command -v gh  >/dev/null 2>&1 || die "没有 gh。Termux 里先跑: pkg install gh"
+
+# 先查代理再联网：死代理是 gh 静默卡死的头号原因，必须先拦下来。
+check_proxy
 
 gh auth status >/dev/null 2>&1 || die "gh 还没登录。先跑: gh auth login （选 GitHub.com → HTTPS → 浏览器或粘贴 token）"
 

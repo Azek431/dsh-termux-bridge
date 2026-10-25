@@ -20,6 +20,15 @@
   2. 建仓与推送原来耦合在 `gh repo create --push` 一条命令里，推送失败时无法区分是建仓失败还是
      凭据失败。现拆成 create → push 两步，push 失败直接打印 `gh auth setup-git` 与
      `gh auth refresh -s repo` 两条修法。
+- `scripts/push-to-github.sh` 增加**死代理预检**。设备上常见「apt 里配了 `127.0.0.1:2080`、
+  但代理程序没起来」，这种死代理会让 `gh` / `git` 在联网那一步**无声挂住**（不报错、只是不动）。
+  典型现场：`gh auth login` 选完 "Authenticate Git with your GitHub credentials? Yes" 之后就再也不动
+  —— 它卡在拉 device code。实测该端口 ECONNREFUSED，而直连 GitHub 正常（200 / 0.4s，
+  device code POST 200 / 0.5s）。脚本现在先探 `http_proxy`/`https_proxy`/`all_proxy`（大小写共 6 个）
+  与 `git config --global http.proxy` 指向的端口，探到死端口直接停下并打印修法。
+- README 新增「`gh auth login` 卡住不动？先查死代理」一节：三步排查（env | grep -i proxy、
+  /dev/tcp 探端口、curl 直连 GitHub）+ 清代理修法 + `GIT_TERMINAL_PROMPT=1`；
+  以及 token 兜底路径 `gh auth login --with-token`。
 
 ### 文档
 
