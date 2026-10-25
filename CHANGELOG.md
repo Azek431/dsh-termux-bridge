@@ -2,6 +2,23 @@
 
 本项目遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [1.2.2] —— 2026-10-26
+
+### 新增
+
+- `scripts/ensure-installed.sh`：本地插件自愈守卫。DSH profile 用 pnpm 管依赖，而 @local
+  插件是手工装配进去的、不在 `dependencies` 里，任何一次 `pnpm install` / GUI 里装别的插件
+  都会把它当幽灵依赖删掉（目录没了、bundles 还记着它 → 下次重启 dsh 插件静默消失）。
+  脚本检测 `node_modules/@local/<pkg>/package.json` 是否存在，缺失就重跑对应安装器。
+  支持 `--check` 只自检（缺失时退出码 1），覆盖 dsh-termux-bridge / dsh-mobile-adapt /
+  mobile-pilot / browser-use 四个包。
+
+### 文档
+
+- README 新增 2.1 节「装完之后请跑一次自检」，说明幽灵依赖的成因与 `--check` 用法。
+- 文档库新增 INC-0009（pnpm 把本地插件当幽灵依赖清掉），记录了两次中招时间点与
+  `.plugin-manager/logs/*/pnpm.log` 里 `Packages: +2 -52` 这个关键证据。
+
 ## [1.2.1] —— 2026-10-26
 
 ### 修复（都是 agent 侧的生命周期缺陷，跟协议无关）

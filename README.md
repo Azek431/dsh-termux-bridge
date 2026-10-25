@@ -17,7 +17,7 @@
 在 Termux 里跑一次启动脚本，auto 就会自动切过去。
 
 - 包名: @local/dsh-termux-bridge
-- 版本: 1.2.1
+- 版本: 1.2.2
 - 作者: **Azek431（艾泽衡）** — Telegram 频道 [@AzekMain](https://t.me/AzekMain) · Azek431@163.com
 - 许可证: GPL-3.0-only（见 LICENSE / NOTICE）
 - 归属: DSHBox（本仓库自研，不含第三方源码）
@@ -72,6 +72,21 @@ install.sh 的事务顺序（照抄 mobile-pilot 的骨架）：
 
 任一步失败：首装则撤半包 + 摘 bundle 条目；升级则把旧包放回原位（旧版保持可用）。
 **这条链路不是原子操作，重装/升级前先停 dsh。**
+
+### 2.1 装完之后请跑一次自检（重要）
+
+DSH 的 profile 用 pnpm 管理依赖，而本插件是**手工装配**进去的：目录被 `mv` 到
+`node_modules/@local/`、bundle 条目被追加进 `package.json`，但它**不在 `dependencies` 里**。
+于是任何一次 `pnpm install` / `pnpm add` / `pnpm prune`（包括在 GUI 里装别的插件）
+都会把它当幽灵依赖删掉 —— 目录没了，bundles 还记着它，下一次重启 dsh 时插件静默消失。
+
+    bash scripts/ensure-installed.sh --check   # 只自检：列出 @local 下缺失的包，缺失则退出码 1
+    bash scripts/ensure-installed.sh           # 自检 + 自动重跑对应安装器补回来
+
+脚本同时覆盖本插件与同机的 `dsh-mobile-adapt` / `mobile-pilot` / `browser-use`
+（三者路径可用 `DSHBOX` 环境变量覆盖）。补装完成后仍需重启 dsh。
+
+建议：**每次通过 GUI 装/升级任何插件之后跑一次 `--check`**，或者在收工前跑一次。
 
 ---
 
