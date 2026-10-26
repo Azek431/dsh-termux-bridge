@@ -84,6 +84,18 @@ class Agent {
     this.jobs = 0
     this.buf = ''
     this.http = undefined
+    /**
+     * agent 在 HELLO 第 4 字段声明的扩展能力（逗号分隔）。
+     * 老 agent 只发 3 个字段，这里就是空串 —— 于是 push 自动退回 base64 的 PUT。
+     * 前向兼容的方向必须是「服务端认得新能力、也照旧伺候老客户端」，
+     * 否则一次插件升级就会把所有还没换脚本的 Termux 全部打断。
+     */
+    this.caps = ''
+  }
+
+  /** 是否支持某项扩展能力。 */
+  has (cap) {
+    return this.caps.split(',').indexOf(cap) >= 0
   }
 }
 
@@ -281,11 +293,19 @@ class Bridge extends EventEmitter {
     if (entry.release) this.#finish(entry.agent)
     const exitCode = Number.isFinite(Number(fields[1])) ? Number(fields[1]) : 6
     if (kind === 'data') {
+      // 这里**不能**直接用 decField：它会对 base64 做 UTF-8 解码，二进制文件里的
+      // 非法字节被静默替换成 U+FFFD —— 2048 字节读成 1945 个字符，长度对不上还 ok=true。
+      // 保留原始字节，交给 decodePayload 判定是文本还是二进制。
+      const raw = proto.decFieldBuffer(fields[2])
+      const payload = proto.decodePayload(raw, { truncated: fields[4] === '1' })
       entry.resolve({
         ok: exitCode === 0,
         exitCode,
         truncated: fields[4] === '1',
-        data: proto.decField(fields[2]),
+        data: payload.text,
+        encoding: payload.encoding,
+        binary: payload.binary,
+        bytes: payload.bytes,
         stderr: proto.decField(fields[3])
       })
       return
@@ -293,9 +313,18 @@ class Bridge extends EventEmitter {
     // fields[6] = agent 侧是否被 timeout 杀掉。有它才能把「命令自己返回 124」和
     // 「我们把它杀了」区分开：两者 exitCode 都是 124，但语义完全不同。
     const timedOut = fields[6] === '1'
+    // fields[7] = 语义标记（目前只有 'cwd'）。老版本 agent 不发这个字段，解出来是空串，
+    // 所以上层必须同时容忍「有 hint」和「只有 exitCode 97」两种来源。
+    // 这里不能叫 kind —— 本函数的第三个形参已经叫 kind（result / data）。
+    // 也不能用 decField：那个函数会把字段当 base64 解，而 'cwd' 恰好是合法 base64，
+    // 解出来是 "s\x07"。这个字段是裸 ASCII 标记，必须原样取值。
+    // 普通路径发的是占位符 '-'（不是 base64 能解的字段，所以也不能复用 decField）。
+    const hintField = (fields[7] || '').trim()
+    const hint = hintField === '-' ? '' : hintField
     entry.resolve({
       ok: exitCode === 0 && !timedOut,
       exitCode,
+      hint,
       elapsedMs: Number(fields[2]) || 0,
       truncated: fields[3] === '1',
       timedOut,
@@ -327,6 +356,11 @@ class Bridge extends EventEmitter {
     }
     agent.registered = true
     agent.name = proto.decField(fields[2]) || 'termux'
+    // HELLO <ver> <token> <name> [caps]：第 4 字段起是逗号分隔的能力声明。
+    // 老 agent 只发三个字段，fields[3] 是 undefined，解析成空串 —— 于是它的 push
+    // 自动退回 base64 的旧 PUT。能力协商必须允许「对面什么都没有」，
+    // 否则一次插件升级就会把所有还没换脚本的 Termux 全部打断。
+    agent.caps = (fields[3] || '').trim()
     // 同名 agent 去重：同一个 Termux 只需要一条连接。旧实例遗留下来的同名连接
     // （例如 DSH 重启后旧 agent 还在重连、而令牌是配置里写死的固定值）如果不摘掉，
     // 一个 Termux 会占满 maxAgents，而且 #idleAgent 可能挑到那条半死的连接。
@@ -362,10 +396,29 @@ class Bridge extends EventEmitter {
     try { agent.socket.write(text); return true } catch { return false }
   }
 
+  /**
+   * 帧头（文本，以 \n 结束）+ 紧跟其后的裸字节。
+   * 两次 write 顺序由 TCP 保证；期间 agent 被 #acquire 独占，
+   * 心跳也跳过 busy 的 agent，所以不会有别的帧插进字节流中间。
+   */
+  #sendWithPayload (agent, head, payload) {
+    try {
+      agent.socket.write(head)
+      if (payload && payload.length) agent.socket.write(payload)
+      return true
+    } catch { return false }
+  }
+
   #startHeartbeat () {
     this.#stopHeartbeat()
     this.heartbeat = setInterval(() => {
       for (const agent of [...this.connections]) {
+        // busy 的 agent 必须**整条跳过**，两个理由都很硬：
+        // 1) 它正卡在 handle_exec 里，根本读不到 PING，更不会回 PONG；
+        // 2) 更致命的是 PUTRAW 期间裸字节正往 socket 里灌，此刻插一个 PING 行
+        //    就等于往用户文件里插垃圾（这一行会被 head -c 当成文件内容写进去）。
+        // 曾因此踩过：一条跑 5 分钟的命令，90 秒时被自己的心跳判死、连接被撕。
+        if (agent.busy) continue
         if (Date.now() - agent.lastSeenAt > HEARTBEAT_DEAD_MS) {
           try { agent.socket.destroy() } catch {}
           continue
@@ -441,8 +494,9 @@ class Bridge extends EventEmitter {
   /**
    * 发一帧并等回包。
    * release=false 用于多帧事务（例如分片 PUT），由调用方在最后一帧后释放。
+   * payload 非空时紧跟在帧头之后原样写出（PUTRAW 的裸字节），不参与分行解析。
    */
-  #roundtrip (agent, id, frame, waitMs, what, release) {
+  #roundtrip (agent, id, frame, waitMs, what, release, payload) {
     return new Promise((resolve, reject) => {
       const timer = setTimeout(() => {
         this.pending.delete(id)
@@ -451,7 +505,8 @@ class Bridge extends EventEmitter {
       }, waitMs)
       if (timer.unref) timer.unref()
       this.pending.set(id, { agent, resolve, reject, timer, release: release !== false })
-      if (!this.#send(agent, frame)) {
+      const sent = payload ? this.#sendWithPayload(agent, frame, payload) : this.#send(agent, frame)
+      if (!sent) {
         this.pending.delete(id)
         clearTimeout(timer)
         if (release !== false) this.#finish(agent)
@@ -505,6 +560,11 @@ class Bridge extends EventEmitter {
     const agent = await this.#acquire(opts.waitMs)
     let written = 0
     try {
+      // 新 agent 支持裸字节通路就走它：同样 1 MiB，base64 分片要 6205ms，
+      // 裸字节实测几十毫秒（差距来自 bash 从 socket 读长行是逐字节 read(2)）。
+      if (agent.has(proto.CAP_RAW_PUT)) {
+        return await this.#pushRaw(agent, data, remotePath, opts)
+      }
       let offset = 0
       let first = true
       // 空文件也要发一帧，否则远端永远不会被创建。
@@ -532,6 +592,43 @@ class Bridge extends EventEmitter {
     }
   }
 
+  /**
+   * 裸字节通路：帧头声明长度，紧随其后的 n 个字节就是文件内容。
+   *
+   * 为什么值得单独开一条路：旧 PUT 把内容 base64 后塞进一行，而 bash 用
+   * `read -u 3` 从 socket 读「一行」是逐字节 read(2) 的 —— 1 MiB 要 6~7 秒。
+   * 裸字节模式让 bash 读完帧头就 `head -c <n> <&3` 直接落盘，
+   * 同一个 1 MiB 降到几十毫秒，而且没有 base64 的 33% 膨胀。
+   *
+   * 分片仍然是串行的（一片一个 roundtrip）：agent 侧一个进程同时只能落一份
+   * 文件，且 #acquire 已经保证这条连接此刻只归我用。
+   */
+  async #pushRaw (agent, data, remotePath, opts) {
+    const total = data.length
+    const pathField = proto.encField(remotePath)
+    let offset = 0
+    let first = true
+    let written = 0
+    do {
+      const chunk = data.subarray(offset, offset + proto.RAW_CHUNK_BYTES)
+      offset += chunk.length
+      const mode = (first && opts.append !== true) ? 'w' : 'a'
+      first = false
+      const id = nextId('putr')
+      // 帧头必须以换行结束：agent 侧先用 read 把这一行读掉，剩下的才是裸字节。
+      const head = 'PUTRAW ' + id + ' ' + mode + ' ' + pathField + ' ' + chunk.length + '\n'
+      const last = offset >= total
+      const r = await this.#roundtrip(agent, id, head, TRANSFER_TIMEOUT_MS, '写远端文件', last, chunk)
+      if (!r.ok) {
+        return Object.assign(r, { bytes: written, remote: remotePath, agent: agent.name, mode: 'raw' })
+      }
+      written += chunk.length
+    } while (offset < total)
+    this.totalJobs += 1
+    this.lastJob = { at: new Date().toISOString(), kind: 'push', bytes: written }
+    return { ok: true, exitCode: 0, stderr: '', bytes: written, remote: remotePath, agent: agent.name, mode: 'raw' }
+  }
+
   /** 把 Termux 里的一个文件读回来（有上限，超了标记 truncated）。 */
   async pull (remotePath, options) {
     const opts = options || {}
@@ -543,7 +640,7 @@ class Bridge extends EventEmitter {
     this.totalJobs += 1
     try {
       const r = await this.#roundtrip(agent, id, frame, TRANSFER_TIMEOUT_MS, '读远端文件', true)
-      this.lastJob = { at: new Date().toISOString(), kind: 'pull', exitCode: r.exitCode }
+      this.lastJob = { at: new Date().toISOString(), kind: 'pull', exitCode: r.exitCode, bytes: r.bytes, binary: !!r.binary }
       return Object.assign(r, { remote: remotePath, agent: agent.name })
     } finally {
       this.#finish(agent)

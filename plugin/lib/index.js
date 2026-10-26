@@ -183,6 +183,63 @@ function quoteArgv (argv) {
   return argv.map((s) => "'" + String(s).replace(/'/g, "'\\''") + "'").join(' ')
 }
 
+/**
+ * 把执行结果映射成错误码。
+ *
+ * 不能只看 exitCode：同一个数字可能来自「我们拦住的」和「命令真的返回的」，
+ * 所以优先级是 超时 > 语义标记 hint > EXIT_<code>。
+ *
+ * 关于 97：两个执行面都用 97 表示 cwd 不存在，但这是**我们自己选**的数字，
+ * 用户脚本完全可能也 exit 97。新 agent 会在 RESULT 末字段带 hint=cwd 说明来源，
+ * 老 agent 不带，那时只能退回 EXIT_97 并在文案里点明这层歧义。
+ */
+function execCode (r) {
+  if (r.timedOut) return 'E_TIMEOUT'
+  const hint = r.hint || r.kind || ''
+  if (hint === 'cwd') return 'E_BAD_CWD'
+  return 'EXIT_' + r.exitCode
+}
+
+/** 给 cwd / 旧版 97 补一句人话，附在 text 末尾。 */
+function execHint (r) {
+  const hint = r.hint || r.kind || ''
+  if (hint === 'cwd') return '工作目录不存在或不是目录，命令没有执行。'
+  if (r.exitCode === 97) return '退出码 97：可能是工作目录不存在（本桥接的约定），也可能是命令自己返回了 97。'
+  return ''
+}
+
+/**
+ * 把 push 的入参变成字节。
+ * base64 是二进制唯一的正确通路：直接传字符串走 UTF-8 会把 0x00/0xff 这类字节破坏掉，
+ * 与 pull 侧 decodePayload 的判定正好对齐。
+ */
+function toPushBuffer (content, encoding) {
+  const enc = String(encoding || 'utf8').toLowerCase()
+  if (enc === 'base64') {
+    const buf = Buffer.from(String(content || ''), 'base64')
+    if (buf.length === 0 && String(content || '').trim() !== '') {
+      throw Object.assign(new Error('content 不是合法的 base64'), { code: 'E_INVALID_ARGUMENT' })
+    }
+    return buf
+  }
+  if (enc !== 'utf8') {
+    throw Object.assign(new Error('不支持的 encoding: ' + encoding + '（只能是 utf8 或 base64）'), { code: 'E_INVALID_ARGUMENT' })
+  }
+  return Buffer.from(String(content == null ? '' : content), 'utf8')
+}
+
+/**
+ * 统一渲染 pull 出来的内容。
+ * 二进制走 base64，此时 content 不是原文，必须显式告知，否则调用方会当文本用。
+ */
+function pullText (remote, r, suffix) {
+  if (r.binary) {
+    return '读取 ' + remote + '（' + r.bytes + ' 字节' + (r.truncated ? '，已截断' : '') + '，二进制）' +
+      '\n文件不是合法 UTF-8 文本，已按 base64 返回；解码后用 buffer 写入，不要直接当文本读。' + (suffix || '')
+  }
+  return '读取 ' + remote + '（' + r.bytes + ' 字节' + (r.truncated ? '，已截断' : '') + '）' + (suffix || '')
+}
+
 // ── 工具构造 ────────────────────────────────────────────────────────────
 
 
@@ -361,7 +418,8 @@ function buildTools ({ defineTool, bridge, config }) {
         const r = backend === 'local'
           ? await local.runScript({ script: args.script, cwd: args.cwd || '', timeoutMs, maxBytes })
           : await bridge.exec({ script: args.script, cwd: args.cwd || '', timeoutMs, maxBytes })
-        return Object.assign(baseFields(r.ok, r.ok ? '' : (r.timedOut ? 'E_TIMEOUT' : 'EXIT_' + r.exitCode), formatExec(r, args.script)), {
+        const tip = r.ok ? '' : execHint(r)
+        return Object.assign(baseFields(r.ok, r.ok ? '' : execCode(r), formatExec(r, args.script) + (tip ? '\n' + tip : '')), {
           exitCode: r.exitCode,
           elapsedMs: r.totalMs,
           truncated: !!r.truncated,
@@ -414,7 +472,8 @@ function buildTools ({ defineTool, bridge, config }) {
         const r = backend === 'local'
           ? await local.runScript({ script, cwd: args.cwd || '', timeoutMs, maxBytes })
           : await bridge.execv(argv, { cwd: args.cwd || '', timeoutMs, maxBytes })
-        return Object.assign(baseFields(r.ok, r.ok ? '' : (r.timedOut ? 'E_TIMEOUT' : 'EXIT_' + r.exitCode), formatExec(r, argv.join(' '))), {
+        const tip = r.ok ? '' : execHint(r)
+        return Object.assign(baseFields(r.ok, r.ok ? '' : execCode(r), formatExec(r, argv.join(' ')) + (tip ? '\n' + tip : '')), {
           exitCode: r.exitCode,
           elapsedMs: r.totalMs,
           truncated: !!r.truncated,
@@ -435,11 +494,14 @@ function buildTools ({ defineTool, bridge, config }) {
   push({
     name: 'termux_push',
     description:
-      '把内容写到文件（覆盖写），目录不存在会自动创建。backend=auto 时：有 Termux agent 就走桥接帧写到 Termux 侧，' +
-      '没有就直接用客人自己的文件系统写（这时路径是客人视角的 / 、/root/projects、/root/share/编程）。改写类操作建议先 termux_pull 备份。',
+      '把内容写到文件（覆盖写），目录不存在会自动创建。content 默认按 UTF-8 编码；' +
+      '要写二进制（图片、压缩包、可执行文件）就先把内容 base64 编码并设 encoding=\'base64\'。' +
+      'backend=auto 时：有 Termux agent 就走桥接帧写到 Termux 侧，没有就直接用客人自己的文件系统写' +
+      '（这时路径是客人视角的 / 、/root/projects、/root/share/编程）。改写类操作建议先 termux_pull 备份。',
     parameters: {
       remotePath: { type: 'string', required: true, description: '目标路径，例如 ~/note.txt 或 /root/share/编程/DeepSeek-Hermes/x.md。' },
-      content: { type: 'string', required: true, description: '要写入的文本内容（按 UTF-8 编码）。' },
+      content: { type: 'string', required: true, description: '要写入的内容。默认 UTF-8 文本；encoding=base64 时是 base64 字符串。' },
+      encoding: { type: 'string', description: 'content 的编码：utf8（默认）或 base64。' },
       backend: BACKEND_SCHEMA
     },
     output: {
@@ -453,13 +515,14 @@ function buildTools ({ defineTool, bridge, config }) {
     execute: async (args) => {
       try {
         const backend = pickBackend(bridge, args.backend)
+        const payload = toPushBuffer(args.content, args.encoding)
         if (backend === 'local') {
-          const r = await local.writeFile(args.content, args.remotePath)
+          const r = await local.writeFile(payload, args.remotePath)
           return Object.assign(baseFields(true, '', '已写入 ' + r.bytes + ' 字节到 ' + r.remote + '（客人本地）'), {
             bytes: r.bytes, remote: r.remote, backend
           })
         }
-        const r = await bridge.push(String(args.content || ''), args.remotePath)
+        const r = await bridge.push(payload, args.remotePath)
         if (!r.ok) {
           return Object.assign(baseFields(false, 'E_REMOTE_WRITE', '写入失败: ' + (r.stderr || ('退出码 ' + r.exitCode))), {
             bytes: r.bytes || 0, remote: r.remote, backend
@@ -479,7 +542,8 @@ function buildTools ({ defineTool, bridge, config }) {
   push({
     name: 'termux_pull',
     description:
-      '读取文件内容（有上限，超过 maxBytes 会截断并置 truncated=true）。只能读文本；二进制文件请先转存或 tar 后再读。' +
+      '读取文件内容（有上限，超过 maxBytes 会截断并置 truncated=true）。文本按 UTF-8 原样返回；' +
+      '不是合法 UTF-8（含 NUL 字节或解码不可逆）时自动按 base64 返回并置 binary=true、encoding=base64，不会再静默损坏。' +
       'backend=auto 时没 Termux agent 就直接读客人自己的文件系统。',
     parameters: {
       remotePath: { type: 'string', required: true, description: '源路径。' },
@@ -488,8 +552,10 @@ function buildTools ({ defineTool, bridge, config }) {
     },
     output: {
       schema: resultSchema({
-        content: { type: 'string', required: true, description: '文件内容（可能被截断）。' },
-        bytes: { type: 'integer', required: true, description: '实际读取的字节数。' },
+        content: { type: 'string', required: true, description: '文件内容（可能被截断）；encoding=base64 时是 base64。' },
+        bytes: { type: 'integer', required: true, description: '实际读取的字节数（真实字节数，与编码无关）。' },
+        encoding: { type: 'string', required: true, description: 'content 的编码：utf8 或 base64。' },
+        binary: { type: 'boolean', required: true, description: '是否为二进制（content 为 base64）。' },
         remote: { type: 'string', required: true, description: '实际读取的路径。' },
         backend: BACKEND_FIELD
       }),
@@ -505,8 +571,14 @@ function buildTools ({ defineTool, bridge, config }) {
               content: '', bytes: 0, remote: r.remote, backend
             })
           }
-          return Object.assign(baseFields(true, '', '读取 ' + r.remote + '（' + r.bytes + ' 字节' + (r.truncated ? '，已截断' : '') + '，客人本地）'), {
-            content: r.data, bytes: r.bytes, truncated: !!r.truncated, remote: r.remote, backend
+          return Object.assign(baseFields(true, '', pullText(r.remote, r, '，客人本地')), {
+            content: r.data,
+            bytes: r.bytes,
+            encoding: r.encoding || 'utf8',
+            binary: !!r.binary,
+            truncated: !!r.truncated,
+            remote: r.remote,
+            backend
           })
         }
         const r = await bridge.pull(args.remotePath, { maxBytes: Number(args.maxBytes) || undefined })
@@ -515,9 +587,11 @@ function buildTools ({ defineTool, bridge, config }) {
             content: '', bytes: 0, remote: args.remotePath, backend
           })
         }
-        return Object.assign(baseFields(true, '', '读取 ' + args.remotePath + '（' + Buffer.byteLength(r.data, 'utf8') + ' 字节' + (r.truncated ? '，已截断' : '') + '）'), {
+        return Object.assign(baseFields(true, '', pullText(args.remotePath, r)), {
           content: r.data,
-          bytes: Buffer.byteLength(r.data, 'utf8'),
+          bytes: r.bytes,
+          encoding: r.encoding || 'utf8',
+          binary: !!r.binary,
           truncated: !!r.truncated,
           remote: args.remotePath,
           backend

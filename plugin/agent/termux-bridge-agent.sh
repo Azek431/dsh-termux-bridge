@@ -18,6 +18,7 @@
 #   WELCOME <ver> <host_b64> | DENY <code> <text_b64>
 #   EXEC <id> <timeout_ms> <cwd_b64|-> <script_b64> <max_bytes>
 #   PUT  <id> <w|a> <path_b64> <data_b64>
+#   PUTRAW <id> <w|a> <path_b64> <nbytes>  ← 本行之后紧跟 nbytes 个裸字节（非 base64）
 #   GET  <id> <path_b64> <max_bytes>
 #   RESULT <id> <exit> <elapsed_ms> <truncated 0|1> <stdout_b64|-> <stderr_b64|-> <timed_out 0|1>
 #   DATA   <id> <exit> <data_b64|-> <stderr_b64|-> <truncated 0|1>
@@ -80,6 +81,15 @@ handle_exec() {
   fi
   printf '%s\n' "$script" > "$dir/body.sh"
   run="$dir/body.sh"
+  # cwd 不存在要单独报出来。只用 exit 97 是不够的：用户自己的脚本也可能 exit 97，
+  # 上层没法区分「路径写错了」和「命令真的返回了 97」。所以先自己探一次目录，
+  # 命中就直接回 RESULT 并带上 kind=cwd；wrap.sh 里的 "|| exit 97" 只作为
+  # 检查与执行之间目录被删掉的竞态兜底。
+  if [ -n "$cwd" ] && [ ! -d "$cwd" ]; then
+    printf 'RESULT %s 97 0 0 - %s 0 cwd\n' "$id" "$(enc "cwd 不存在或不是目录: $cwd")" >&3
+    rm -rf "$dir" 2>/dev/null
+    return
+  fi
   if [ -n "$cwd" ]; then
     {
       printf 'cd '
@@ -125,7 +135,7 @@ RUNNER
   ob=$(head -c "$max" "$dir/out" 2>/dev/null | b64e); [ -z "$ob" ] && ob='-'
   eb=$(head -c 65536 "$dir/err" 2>/dev/null | b64e); [ -z "$eb" ] && eb='-'
 
-  printf 'RESULT %s %s %s %s %s %s %s\n' "$id" "$code" "$(( end - start ))" "$trunc" "$ob" "$eb" "$timed" >&3
+  printf 'RESULT %s %s %s %s %s %s %s -\n' "$id" "$code" "$(( end - start ))" "$trunc" "$ob" "$eb" "$timed" >&3
   rm -rf "$dir" 2>/dev/null
 }
 
@@ -145,6 +155,48 @@ handle_put() {
   printf 'RESULT %s %s 0 0 - %s 0\n' "$id" "$code" "$(enc '')" >&3
 }
 
+handle_putraw() {
+  local id="$1" mode="$2" path_f="$3" nbytes="$4"
+  local path before=0 after=0 wrote code=0
+  path=$(dec "$path_f")
+  case "$nbytes" in ''|*[!0-9]*) nbytes=0 ;; esac
+  # 无论路径是否合法，这 nbytes 个字节都必须从流里读走。
+  # 留在 socket 里的字节会被当成下一帧的帧头，之后整条连接就全乱了 ——
+  # 症状是「突然开始报未知帧」，而且不会自愈。
+  if [ -z "$path" ]; then
+    head -c "$nbytes" <&3 >/dev/null 2>&1
+    printf 'RESULT %s 96 0 0 - %s 0\n' "$id" "$(enc '远端路径为空')" >&3
+    return
+  fi
+  mkdir -p "$(dirname "$path")" 2>/dev/null
+  [ "$mode" = "a" ] && [ -f "$path" ] && before=$(wc -c < "$path" 2>/dev/null)
+  case "$before" in ''|*[!0-9]*) before=0 ;; esac
+  # head -c N 的读循环每次 read(MIN(剩余, BUFSIZ))，不会多吃一个字节，
+  # 所以紧随其后的下一帧帧头是安全的；对端半路消失时也不会永久阻塞。
+  if have timeout; then
+    if [ "$mode" = "a" ]; then
+      timeout -k 2 120 head -c "$nbytes" <&3 >> "$path" || code=$?
+    else
+      timeout -k 2 120 head -c "$nbytes" <&3 > "$path" || code=$?
+    fi
+  else
+    if [ "$mode" = "a" ]; then
+      head -c "$nbytes" <&3 >> "$path" || code=$?
+    else
+      head -c "$nbytes" <&3 > "$path" || code=$?
+    fi
+  fi
+  after=$(wc -c < "$path" 2>/dev/null)
+  case "$after" in ''|*[!0-9]*) after=0 ;; esac
+  wrote=$(( after - before ))
+  # 短读必须显式报错：半截文件看起来和成功一模一样，
+  # 用户拿到 ok=true 却得到被截断的二进制，比直接失败难查得多。
+  if [ "$wrote" -ne "$nbytes" ]; then
+    printf 'RESULT %s 96 0 0 - %s 0\n' "$id" "$(enc "只收到 $wrote/$nbytes 字节，连接可能中断")" >&3
+    return
+  fi
+  printf 'RESULT %s %s 0 0 - %s 0\n' "$id" "$code" "$(enc '')" >&3
+}
 handle_get() {
   local id="$1" path_f="$2" max="$3" path size data eb trunc=0 code=0
   path=$(dec "$path_f")
@@ -187,7 +239,9 @@ while [ "$FATAL" = 0 ]; do
     sleep "$BACKOFF"
     continue
   fi
-  printf 'HELLO 1 %s %s\n' "$(enc "$TOKEN")" "$(enc "$NAME")" >&3
+  # 第 4 字段是能力声明：服务端据此决定用 PUTRAW(裸字节) 还是老的 PUT(base64)。
+  # 老服务端会忽略多余字段，所以这条改动对旧版服务端是安全的。
+  printf 'HELLO 1 %s %s raw\n' "$(enc "$TOKEN")" "$(enc "$NAME")" >&3
   say "已连接，等待任务…"
 
   silent=0
@@ -249,6 +303,10 @@ while [ "$FATAL" = 0 ]; do
       PUT)
         IFS=' ' read -r -a F <<< "$rest"
         handle_put "${F[0]:-}" "${F[1]:-w}" "${F[2]:--}" "${F[3]:--}"
+        ;;
+      PUTRAW)
+        IFS=' ' read -r -a F <<< "$rest"
+        handle_putraw "${F[0]:-}" "${F[1]:-w}" "${F[2]:--}" "${F[3]:-0}"
         ;;
       GET)
         IFS=' ' read -r -a F <<< "$rest"

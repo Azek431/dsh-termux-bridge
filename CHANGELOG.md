@@ -2,6 +2,96 @@
 
 本项目遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [1.2.8] —— 2026-10-26
+
+修掉一个**静默数据损坏**的真 bug，把大文件传输提速两个数量级，并让「cwd 不存在」这件事
+从一串魔法数字变成可判读的语义。
+
+### 修复
+
+- **`termux_pull` 读二进制文件会静默损坏，且 `ok` 仍是 `true`**。这是本次最重要的修复。
+  根因在 `plugin/lib/bridge.js` 的 `#settle`：DATA 帧走的是 `decField()`，
+  而它内部是 `Buffer.from(field, 'base64').toString('utf8')` —— 拿回字节后**又顺手做了一次
+  UTF-8 解码**，非法字节被静默替换成 `U+FFFD`。现象：2048 字节的文件读出来只有 1945 个字符，
+  长度对不上，但调用方看到的是 `ok: true`，不报任何错。这类损坏最坏的地方在于**它不失败**。
+  修法是拆成两步：新增 `decFieldBuffer()` 只负责把 base64 解回原始 `Buffer`，
+  再由新增的 `protocol.decodePayload()` 判定编码 —— **不含 NUL 字节、且 UTF-8 往返编码完全一致**
+  才算文本，否则按 base64 返回并置 `binary: true`。`decField()` 保留但不再用于数据载荷。
+- **截断落在多字节字符中间会把纯文本误判成二进制**。`maxBytes` 截断可能正好切在一个汉字或
+  emoji 的中间，尾部留下 1~3 个不完整字节，整段就被判成非法 UTF-8。新增
+  `trimIncompleteUtf8()`，从尾部最多回退 3 个字节找合法边界再判定，避免这种误报。
+- **`local` 执行面有同样的毛病**。`plugin/lib/local.js` 原先也是直接 `toString('utf8')` 读文件，
+  现在同样走 `decodePayload()`，两个执行面的编码语义终于一致。
+
+### 新增
+
+- **`termux_pull` 输出新增 `encoding`（`utf8` | `base64`）与 `binary`（boolean）两个字段**，
+  `bytes` 改为**真实字节数**（与编码无关，不再是 content 的字符长度）。
+  判定规则收窄成一句话：**不含 NUL 且是合法 UTF-8 才算文本**。这样调用方不再需要猜，
+  「判断大小只看 `bytes`，解释 `content` 先看 `encoding`」。
+- **`termux_push` 新增 `encoding` 参数**（`utf8` 默认 / `base64`）。二进制不再是单行道：
+  pull 出来的 base64 可以原样 push 回去，与出口正好对齐，能往返。传了非法的 base64
+  会明确报 `E_INVALID_ARGUMENT`，而不是写入一堆空字节。
+- **`cwd` 不存在返回语义化错误码 `E_BAD_CWD`**（原来只有 `EXIT_97`）。agent 侧在
+  `handle_exec` 里**先预探测** `cwd`，不存在就直接返回，命令根本不会执行
+  （`wrap.sh` 的 `|| exit 97` 只作竞态兜底）。
+- **RESULT 帧新增第 8 字段 `hint`**（裸 ASCII 语义标记，**不是 base64**）：普通路径写 `-`，
+  cwd 不存在写 `cwd`。这里有个坑值得记下来 —— 这一列**不能**用 `decField()` 解，
+  因为字符串 `cwd` 恰好是合法 base64，会被解成 `"s\x07"`。上层由此能区分
+  「我们拦住的 97」和「命令自己 exit 97」，后者会在 `text` 末尾附一句
+  「97 也可能是命令自己返回的」。
+- **老 agent 自动兼容**：不发第 8 字段时按空串处理，退回 `EXIT_97`。
+  agent 是用户手动起的，新老混装是常态，这一点必须容忍。
+- **`termux_status` / `lastJob` 增加 `bytes` 与 `binary`**，排障时能看出最近一次 pull
+  拿回多少字节、是不是二进制。
+
+### 性能
+
+- **新增 `PUTRAW` 裸字节上行通路**，1 MiB 上传从**秒级降到毫秒级**。
+  瓶颈一开始被误判成 base64 编码慢，其实不是 —— 编解码本身只要几十毫秒。真正的原因是
+  **bash 的 `read -u 3` 从 socket 读「一行」是逐字节 `read(2)`**：
+  1 MiB 的 PUT 行要 **7206ms**，而同样大小的裸字节用 `head -c` 只要 **34ms**。
+  所以 `PUTRAW` 改成「帧头行 + 紧随其后的裸字节」：
+
+      PUTRAW <id> <w|a> <path_b64> <nbytes>\n
+      <nbytes 个原始字节，不含任何分隔>
+
+  agent 读完帧头那一行后，直接 `head -c <nbytes> <&3` 落盘。这条通路**必须在 agent 空闲时独占** ——
+  裸字节流里混进一个 PING 行就等于往文件内容里插垃圾，所以桥接侧的串行派活与心跳跳过忙 agent
+  这两条约束都成了硬性前提。
+- **`RAW_CHUNK_BYTES = 4 MiB`**，不受 `MAX_LINE_BYTES` 约束（裸字节不是一行，不吃「一行一次 read」
+  的惩罚），于是 1 MiB 文件 = 1 帧、4 MiB 文件 = 1 帧，来回次数压到最少。
+- **能力协商，老 agent 自动回退**：agent 在 HELLO 第 4 字段声明 `raw`，桥接侧据此走 `#pushRaw`；
+  没有声明就走老的 base64 分片。**功能完全等价，只是慢**，不会因为版本不同而报错。
+- **`MAX_LINE_BYTES` 从 1 MiB 提到 16 MiB**。这是个真踩过的坑：协议层上限必须**显式大于**
+  载荷上限（base64 膨胀 4/3），而旧值恰好等于输出上限 —— `maxBytes=1 MiB` 时数据帧约 1.4 MiB，
+  超过 1 MiB 上限被接收端直接 `destroy`，调用方看到的是**莫名其妙的 `E_AGENT_GONE`**。
+
+实测（同一台设备，loopback，中位数）：
+
+| 场景 | 1.2.7 | 1.2.8 | 倍数 |
+|---|---|---|---|
+| push 1 MiB | 9363 ms | **68 ms** | 约 138× |
+| push 4 MiB | 28361 ms | **66 ms** | 约 430× |
+
+pull 方向不受这次改动影响：1 MiB 约 119 ms、4 MiB 约 473 ms。两个方向的字节**完全一致**
+（`allIdentical: true`），提速没有以正确性为代价。
+
+### 已验证
+
+- `node --test test/bridge.test.cjs` → **tests 29 / pass 29 / fail 0 / cancelled 0**，
+  duration 14.6s，进程自然退出（EXIT=0）。用例从 20 条增加到 **29 条**，新增的 9 条全是围绕
+  这次改动的回归：pull 二进制不损坏、带 NUL 时降级 base64、截断落多字节字符中间不误判、
+  cwd 不存在带 `hint=cwd`、普通失败不带 hint、local 面读二进制、push 二进制与 pull 往返、
+  `decodePayload` 与 push 的 base64 通路自洽、`decodePayload` 的单位边界。
+- 二进制往返由用例坐实：pull 4096 字节、push 5000 字节两组都以 `Buffer.equals` 逐字节比对，
+  `bytes` 与原始长度精确相等（修复前同一份数据会少掉若干字符却不报错）。
+- cwd 语义由两条用例分别坐实：cwd 不存在时 `hint=cwd`（上层映射成 `E_BAD_CWD`）；
+  命令自己失败时 hint 为空 —— 保证用户脚本自己的 `exit 97` 不会被误标成路径问题。
+- 老 agent 的 base64 回退路径**只做了代码核对，未单独立用例**：`push()` 里按
+  `agent.has(CAP_RAW_PUT)` 分流，未声明 `raw` 时走原有的分片实现，该分支在 1.2.7 已被
+  「多片 push / pull 往返」用例覆盖。
+
 ## [1.2.7] —— 2026-10-26
 
 把 `@local/dsh-termux-bridge` 从「幽灵目录」变成**有声明的依赖**。

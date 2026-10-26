@@ -17,7 +17,7 @@
 在 Termux 里跑一次启动脚本，auto 就会自动切过去。
 
 - 包名: @local/dsh-termux-bridge
-- 版本: 1.2.7
+- 版本: 1.2.8
 - 作者: **Azek431（艾泽衡）** — Telegram 频道 [@AzekMain](https://t.me/AzekMain) · Azek431@163.com
 - 许可证: GPL-3.0-only（见 LICENSE / NOTICE）
 - 归属: DSHBox（本仓库自研，不含第三方源码）
@@ -157,13 +157,33 @@ profile 回到安装前的状态。判据是装之前有没有旧版（`HAD_PREV
 | termux_bootstrap | 生成 Termux 侧启动命令、URL 与脚本正文（inline:false 可只要命令）。不跑也能执行命令。 |
 | termux_exec | 执行一段 bash 脚本正文。支持 cwd / backend / timeoutMs / maxBytes。 |
 | termux_run | 以 argv 数组执行命令（不经过 shell 二次解析，最安全）。 |
-| termux_push | 把文本写到目标路径（覆盖写，目录不存在自动建）。 |
-| termux_pull | 读目标文件（默认最多 8 MiB）。 |
+| termux_push | 把内容写到目标路径（覆盖写，目录不存在自动建）。默认按 UTF-8 写文本，`encoding: base64` 可写任意二进制。 |
+| termux_pull | 读目标文件（默认最多 8 MiB）。文本原样回 UTF-8，二进制按 base64 回并显式标记。 |
 
 所有工具的输出都是结构化对象，字段固定：
 ok / code / text / exitCode / elapsedMs / truncated / timedOut（+ 各自扩展字段，
-exec / run / push / pull 另有 backend 表示实际执行面）。
+exec / run / push / pull 另有 backend 表示实际执行面；pull 另有 encoding / binary / bytes）。
 **机器判读读字段，不要解析 text。**
+
+### 二进制文件（pull / push，1.2.8 起）
+
+termux_pull 的 content 有两种编码，靠 encoding 字段区分：
+
+| encoding | binary | content 是什么 | bytes |
+|---|---|---|---|
+| utf8 | false | 文件原文（UTF-8） | 真实字节数 |
+| base64 | true | 原始字节的 base64 | 真实字节数（**不是** content 的长度） |
+
+判定规则：**不含 NUL 字节、且是合法 UTF-8** 才算文本，否则一律按 base64 回传并置 binary=true。
+截断正好切在多字节字符中间时，会从尾部最多回退 3 个字节找合法边界，不会把纯文本误判成二进制。
+
+这条判定是 1.2.8 修的 bug：此前 DATA 帧走 decField()，它内部是
+Buffer.from(field,"base64").toString("utf8")，非法字节被**静默替换成 U+FFFD**——
+2048 字节的文件读出来只有 1945 个字符，长度对不上，ok 却依然是 true。
+所以 bytes 与 encoding 是两个独立事实：**判断大小只看 bytes，解释 content 先看 encoding**。
+二进制内容不要直接当文本读。
+
+写回去用 termux_push 的 encoding: 'base64'，与 pull 的出口正好对齐，可以往返。
 
 ### backend 参数（exec / run / push / pull）
 
@@ -179,7 +199,26 @@ push / pull，不要以为写一次两边都能看见。
 
 错误码：E_NO_AGENT（强制 termux 但没连上）、E_AGENT_BUSY（队列满/agent 忙）、
 E_AGENT_TIMEOUT（等回包超时，远端可能仍在跑）、E_AGENT_GONE（连接中断，结果未知）、
-E_TIMEOUT（命令被 timeoutMs 强杀，timedOut=true）、E_INVALID_ARGUMENT（backend 写错）。
+E_TIMEOUT（命令被 timeoutMs 强杀，timedOut=true）、E_BAD_CWD（工作目录不存在，命令没有执行）、
+E_INVALID_ARGUMENT（backend 写错 / encoding 不支持）。
+
+### cwd 不存在：E_BAD_CWD 与退出码 97 的歧义
+
+cwd 指向不存在的目录时，命令**根本不会执行**，直接返回 `E_BAD_CWD`。
+这个错误码是 1.2.8 新加的，此前只有 `EXIT_97`。
+
+97 这个数字是**本插件自己选的**约定，不是 shell 的通用约定 —— 所以用户脚本
+完全可能自己 `exit 97`，此时看退出码就分不清「路径写错了」和「命令真的返回了 97」。
+1.2.8 的处理是把来源显式标出来：
+
+| 情况 | code | 说明 |
+|---|---|---|
+| cwd 不存在（新 agent） | E_BAD_CWD | agent 在 RESULT 末字段带 `hint=cwd`，来源确定 |
+| cwd 不存在（老 agent） | EXIT_97 | 老 agent 不发 hint 字段，只能退回看退出码 |
+| 命令自己 `exit 97` | EXIT_97 | hint 为空；text 里会点明「97 也可能是命令自己返回的」 |
+
+**所以拿到 EXIT_97 时不要一口咬定是路径问题**，先看 text 末尾那句话，或确认 cwd 真的存在。
+新老 agent 混装是正常状态（agent 是用户手动起的），两种来源都得容忍。
 
 ### 超时语义（容易踩）
 
@@ -203,11 +242,19 @@ E_TIMEOUT（命令被 timeoutMs 强杀，timedOut=true）、E_INVALID_ARGUMENT�
     EXEC   <id> <timeout_ms> <cwd_b64|-> <script_b64> <max_bytes>
     PUT    <id> <w|a> <path_b64> <data_b64>
     GET    <id> <path_b64> <max_bytes>
-    RESULT <id> <exit> <elapsed_ms> <trunc 0|1> <stdout_b64|-> <stderr_b64|-> <timed_out 0|1>
+    RESULT <id> <exit> <elapsed_ms> <trunc 0|1> <stdout_b64|-> <stderr_b64|-> <timed_out 0|1> <hint|->
     DATA   <id> <exit> <data_b64|-> <stderr_b64|-> <trunc 0|1>
     PING   <id>  ->  PONG <id>
 
-约束：PROTO_VERSION=1、MAX_LINE_BYTES=1 MiB、MAX_SCRIPT_BYTES=256 KiB。
+约束：PROTO_VERSION=1、MAX_LINE_BYTES=16 MiB、MAX_SCRIPT_BYTES=256 KiB。
+
+RESULT 的第 8 字段 `hint` 是 1.2.8 新加的**裸 ASCII 语义标记**（不是 base64，普通路径写 `-`，
+cwd 不存在写 `cwd`）。它解决的是「97 是谁给的」这个问题，见 3.1 节。老 agent 不发这个字段，
+解析时按空串处理即可 —— 这也是为什么上层必须容忍缺失。
+
+MAX_LINE_BYTES 必须是**载荷上限的 1.33 倍以上**：base64 会膨胀 4/3。这曾经是个真 bug ——
+帧上限和输出上限都设成 1 MiB，于是 maxBytes=1 MiB 时数据帧变成约 1.4 MiB > 1 MiB，
+接收端直接 destroy，调用方看到的是莫名其妙的 E_AGENT_GONE。协议层上限必须显式大于载荷上限。
 
 同端口还兼一个极简 HTTP 面（按首行 GET/HEAD 分流），只回 /agent 与 /agent.sh
 （渲染好占位符的 agent 脚本），其余一律 404 —— 这就是 curl 那一行能拿到脚本的原因。
@@ -264,7 +311,7 @@ agent 侧有 --quiet 参数可关掉 stderr 日志。
 
 ## 8. 测试
 
-    node --test test/bridge.test.cjs     # 20 条：协议 / 执行 / push-pull / 超时语义 / 大输出 / agent 生命周期 / HTTP 面
+    node --test test/bridge.test.cjs     # 29 条：协议 / 执行 / push-pull / 二进制编码 / 超时语义 / 大输出 / agent 生命周期 / HTTP 面
     node test/smoke.cjs                  # 冒烟：真加载 profile 里的包，两个执行面各跑一遍
 
 套件约 14 秒跑完并**干净退出**（1.2.6 修掉了此前"20 条全过但进程永不退出"的管道泄漏，见下）。

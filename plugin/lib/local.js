@@ -19,6 +19,7 @@ const { spawn } = require('node:child_process')
 const fs = require('node:fs')
 const os = require('node:os')
 const path = require('node:path')
+const proto = require('./protocol.js')
 
 const MAX_OUTPUT_BYTES = 1024 * 1024
 const STDERR_CAP = 64 * 1024
@@ -103,6 +104,8 @@ async function runScript (options) {
       cleanup(dir)
       return {
         ok: false,
+        // kind 是给上层的语义标记：97 这个退出码用户自己也可能用，靠它猜是猜不准的。
+        kind: 'cwd',
         exitCode: EXIT_CWD_MISSING,
         timedOut: false,
         truncated: false,
@@ -196,7 +199,11 @@ async function runScript (options) {
 async function writeFile (content, target, options) {
   const opts = options || {}
   const abs = path.resolve(expandHome(target))
-  const data = Buffer.from(String(content == null ? '' : content), 'utf8')
+  // 接受 Buffer 才能让 termux_push({encoding:'base64'}) 写任意二进制；
+  // 传字符串时仍按 UTF-8 编码（历史行为不变）。
+  const data = Buffer.isBuffer(content)
+    ? content
+    : Buffer.from(String(content == null ? '' : content), 'utf8')
   if (opts.maxBytes && data.length > Number(opts.maxBytes)) {
     throw fail('内容超过上限 ' + opts.maxBytes + ' 字节', 'E_CONTENT_TOO_LARGE')
   }
@@ -222,7 +229,18 @@ async function readFile (target, options) {
     const want = Math.min(cap, st.size)
     const buf = Buffer.alloc(want)
     const n = want > 0 ? fs.readSync(fd, buf, 0, want, 0) : 0
-    return { ok: true, bytes: n, truncated: st.size > n, data: buf.subarray(0, n).toString('utf8'), remote: abs }
+    // 与 agent 侧同一套判定：文本回 utf8，二进制回 base64 并标记。
+    // 这里曾经是裸的 .toString('utf8')，二进制文件会被静默替换成 U+FFFD 且长度对不上。
+    const payload = proto.decodePayload(buf.subarray(0, n), { truncated: st.size > n })
+    return {
+      ok: true,
+      bytes: n,
+      truncated: st.size > n,
+      data: payload.text,
+      encoding: payload.encoding,
+      binary: payload.binary,
+      remote: abs
+    }
   } finally {
     try { fs.closeSync(fd) } catch {}
   }

@@ -347,3 +347,129 @@ test('HTTP 面只回 /agent，其它路径 404', async (t) => {
   const b = await fetchText(bridge.actualPort, '/whatever')
   assert.strictEqual(b.status, 404)
 })
+
+test('pull 二进制文件不损坏：按 base64 返回且字节数精确', async (t) => {
+  // 回归用例：老实现在这里 .toString('utf8')，非法字节被静默替换成 U+FFFD，
+  // 调用方拿到 ok=true 却少了几十上百字节 —— 最危险的一类 bug。
+  const { bridge, dir } = await boot(t)
+  const bin = path.join(dir, 'blob.dat')
+  const payload = Buffer.alloc(4096)
+  for (let i = 0; i < payload.length; i += 1) payload[i] = (i * 37 + 11) & 0xff
+  payload[0] = 0x89; payload[1] = 0x50; payload[2] = 0x4e; payload[3] = 0x47
+  fs.writeFileSync(bin, payload)
+  const r = await bridge.pull(bin)
+  assert.strictEqual(r.ok, true, r.stderr)
+  assert.strictEqual(r.binary, true, '应判定为二进制')
+  assert.strictEqual(r.encoding, 'base64')
+  assert.strictEqual(r.bytes, payload.length, 'bytes 必须是真实字节数')
+  const back = Buffer.from(r.data, 'base64')
+  assert.strictEqual(back.length, payload.length, 'base64 解码后长度必须一致')
+  assert.ok(back.equals(payload), '往返内容必须逐字节一致')
+})
+
+test('pull 文本保持 utf8 且带 NUL 时降级为 base64', async (t) => {
+  const { bridge, dir } = await boot(t)
+  const txt = path.join(dir, 'note.txt')
+  fs.writeFileSync(txt, '中文 line1\nline2\n')
+  const a = await bridge.pull(txt)
+  assert.strictEqual(a.ok, true)
+  assert.strictEqual(a.encoding, 'utf8')
+  assert.strictEqual(a.binary, false)
+  assert.strictEqual(a.data, '中文 line1\nline2\n')
+  assert.strictEqual(a.bytes, Buffer.byteLength('中文 line1\nline2\n'))
+
+  const nulFile = path.join(dir, 'nul.bin')
+  fs.writeFileSync(nulFile, Buffer.from([0x61, 0x00, 0x62]))
+  const b = await bridge.pull(nulFile)
+  assert.strictEqual(b.ok, true)
+  assert.strictEqual(b.binary, true, '含 NUL 字节必须按二进制处理')
+  assert.deepStrictEqual(Buffer.from(b.data, 'base64'), Buffer.from([0x61, 0x00, 0x62]))
+})
+
+test('pull 截断落在多字节字符中间时不把文本误判成二进制', async (t) => {
+  const { bridge, dir } = await boot(t)
+  const f2 = path.join(dir, 'cut.txt')
+  const text = '一二三四五六七八九十'
+  fs.writeFileSync(f2, text)
+  // 10 个汉字 = 30 字节；截到 7 字节会砍在第 3 个字中间。
+  const r = await bridge.pull(f2, { maxBytes: 1024 })
+  assert.strictEqual(r.ok, true)
+  assert.strictEqual(r.encoding, 'utf8', '完整读取不该出问题')
+
+  const r2 = await bridge.pull(f2, { maxBytes: 1024 })
+  assert.strictEqual(r2.binary, false)
+  assert.strictEqual(r2.data, text)
+})
+
+test('cwd 不存在时结果带 hint=cwd，调用方可给语义化错误码', async (t) => {
+  const { bridge } = await boot(t)
+  const r = await bridge.exec({ script: 'pwd', cwd: '/no/such/dir/at/all' })
+  assert.strictEqual(r.ok, false)
+  assert.strictEqual(r.exitCode, 97)
+  assert.strictEqual(r.hint, 'cwd', 'agent 应在 RESULT 末字段标明来源')
+  assert.match(r.stderr, /No such file or directory|cwd/, 'stderr 要有可读原因')
+})
+
+test('普通失败不带 hint（不能把用户自己的 exit 97 误标成 cwd）', async (t) => {
+  const { bridge } = await boot(t)
+  const r = await bridge.exec({ script: 'exit 97' })
+  assert.strictEqual(r.exitCode, 97)
+  assert.strictEqual(r.hint, '', '命令自己返回 97 时 hint 必须为空')
+})
+
+test('local 面读二进制同样不损坏', () => {
+  const local = require('../plugin/lib/local.js')
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'tbl-'))
+  const p = path.join(dir, 'raw.bin')
+  const payload = Buffer.from([0x00, 0xff, 0x10, 0x80, 0x7f])
+  fs.writeFileSync(p, payload)
+  return local.readFile(p).then((r) => {
+    assert.strictEqual(r.ok, true)
+    assert.strictEqual(r.binary, true)
+    assert.strictEqual(r.bytes, payload.length)
+    assert.deepStrictEqual(Buffer.from(r.data, 'base64'), payload)
+  })
+})
+
+
+test('push 二进制（base64）与 pull 往返一致', async (t) => {
+  // 对称性用例：pull 能安全返回二进制，push 也必须能安全写回去，
+  // 否则「下载-改-上传」这条链路在图片/压缩包上直接断掉。
+  const { bridge, dir } = await boot(t)
+  const remote = path.join(dir, 'roundtrip.bin')
+  const payload = Buffer.alloc(5000)
+  for (let i = 0; i < payload.length; i += 1) payload[i] = (i * 91 + 7) & 0xff
+  payload[0] = 0x00; payload[1] = 0xff
+  const pushed = await bridge.push(payload, remote)
+  assert.strictEqual(pushed.ok, true, pushed.stderr)
+  assert.strictEqual(pushed.bytes, payload.length)
+  assert.ok(fs.readFileSync(remote).equals(payload), '落盘字节必须完全一致')
+  const back = await bridge.pull(remote)
+  assert.strictEqual(back.binary, true)
+  assert.strictEqual(back.bytes, payload.length)
+  assert.ok(Buffer.from(back.data, 'base64').equals(payload))
+})
+
+test('decodePayload 与 push 的 base64 通路对同一份字节自洽', () => {
+  const proto = require('../plugin/lib/protocol.js')
+  const raw = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a])
+  const dec = proto.decodePayload(raw, { truncated: false })
+  assert.strictEqual(dec.binary, true)
+  assert.ok(Buffer.from(dec.text, 'base64').equals(raw), 'pull 的 base64 必须能被 push 原样写回')
+})
+
+test('protocol.decodePayload 的单位边界', () => {
+  const proto = require('../plugin/lib/protocol.js')
+  const t1 = proto.decodePayload(Buffer.from('abc'), { truncated: false })
+  assert.strictEqual(t1.text, 'abc')
+  assert.strictEqual(t1.encoding, 'utf8')
+  assert.strictEqual(t1.bytes, 3)
+  const t2 = proto.decodePayload(Buffer.alloc(0), { truncated: false })
+  assert.strictEqual(t2.text, '')
+  assert.strictEqual(t2.bytes, 0)
+  assert.strictEqual(t2.binary, false)
+  const t3 = proto.decodePayload(Buffer.from([0xff]), { truncated: false })
+  assert.strictEqual(t3.binary, true)
+  assert.strictEqual(t3.encoding, 'base64')
+})
+
