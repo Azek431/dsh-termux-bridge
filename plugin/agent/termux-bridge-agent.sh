@@ -6,7 +6,7 @@
 # Termux 进程，两边也没有共享文件系统。唯一的联系是共享同一个网络命名空间，
 # 所以只能由你在 Termux 里手动起一次本脚本，让它连回 loopback。
 #
-# 零依赖：只用 bash 内建 + base64 + date + mktemp（Termux 基础包自带）。
+# 零依赖：只用 bash 内建 + base64 + date（Termux 基础包自带）。
 # 不装 nc / socat / jq / python。
 #
 # 用法：
@@ -14,15 +14,21 @@
 #   nohup bash ~/dsh-termux-agent.sh >/dev/null 2>&1 &   # 后台跑
 #
 # 协议：一行一帧，空格分列，所有可能含空格的字段都是 base64（空值写 '-'）。
-#   HELLO <ver> <token_b64> <name_b64>
+#   HELLO <ver> <token_b64> <name_b64> <caps>
 #   WELCOME <ver> <host_b64> | DENY <code> <text_b64>
-#   EXEC <id> <timeout_ms> <cwd_b64|-> <script_b64> <max_bytes>
+#   EXEC    <id> <timeout_ms> <cwd_b64|-> <script_b64> <max_bytes>
+#   EXECRAW <id> <timeout_ms> <cwd_b64|-> <nbytes> <max_bytes>
+#           <<< 本行之后紧跟 nbytes 个裸字节的脚本正文（非 base64）
 #   PUT  <id> <w|a> <path_b64> <data_b64>
-#   PUTRAW <id> <w|a> <path_b64> <nbytes>  ← 本行之后紧跟 nbytes 个裸字节（非 base64）
+#   PUTRAW <id> <w|a> <path_b64> <nbytes>  <<< 本行之后紧跟 nbytes 个裸字节（非 base64）
 #   GET  <id> <path_b64> <max_bytes>
-#   RESULT <id> <exit> <elapsed_ms> <truncated 0|1> <stdout_b64|-> <stderr_b64|-> <timed_out 0|1>
+#   RESULT <id> <exit> <elapsed_ms> <truncated 0|1> <stdout_b64|-> <stderr_b64|-> <timed_out 0|1> [hint]
 #   DATA   <id> <exit> <data_b64|-> <stderr_b64|-> <truncated 0|1>
 #   PING <id> -> PONG <id>
+#
+# 为什么要有 EXECRAW（1.2.9）：脚本走 base64 时，光是从 socket 读完那一行就要
+# 逐字节 read(2)（几十毫秒），还得再 fork 两个进程做 base64 -d。裸字节让
+# head -c N 直接从 socket 落盘，既没有 33% 膨胀，也不用额外进程。
 # =============================================================================
 set -u
 
@@ -47,47 +53,100 @@ if ! have base64; then
   exit 1
 fi
 
-b64e() { base64 | tr -d '\n'; }
+# base64 -w0 一次进程就出「不带换行」的结果。busybox 版没有 -w，退回 base64|tr 两进程。
+B64W=0
+if printf x | base64 -w0 >/dev/null 2>&1; then B64W=1; fi
+b64pipe() { if [ "$B64W" = 1 ]; then base64 -w0; else base64 | tr -d '\n'; fi; }
+b64file() { if [ "$B64W" = 1 ]; then base64 -w0 < "$1"; else base64 < "$1" | tr -d '\n'; fi; }
+b64e() { b64pipe; }
 b64d() { base64 -d 2>/dev/null; }
 # 空串必须编码成 '-'，否则空格分列会把字段个数弄错。
 enc() { local s; s=$(printf '%s' "$1" | b64e); [ -z "$s" ] && s='-'; printf '%s' "$s"; }
 dec() { [ "$1" = '-' ] && return 0; printf '%s' "$1" | b64d; }
 
-now_ms() {
-  local t
-  t=$(date +%s%3N 2>/dev/null)
-  case "$t" in
-    *N*) printf '%s' $(( $(date +%s) * 1000 )) ;;
-    *)   printf '%s' "$t" ;;
+# ── 回包写法的分界点：一次 write 还是流式 ─────────────────────────────────
+# 实测出来的硬约束（/tmp/nagleproof.cjs，n=2 轮 × 9 次）：同一份回包内容，
+# 一次 write 发完是 0ms，拆成 2~3 次 write 发是固定 40ms。
+# 那 40ms 不是我们的代码慢，是 TCP 的 Nagle + 延迟 ACK：
+# 第一段小数据发出去后，后续 write 要等对端 ACK，而对端在等 40ms 的延迟 ACK 定时器。
+# 桥接侧（Node）自己的 socket 已经 setNoDelay(true)（bridge.js:206），但那管不到
+# agent 这一侧 —— bash 的 /dev/tcp 没有 setsockopt，TCP_NODELAY 在这里设不了。
+# 所以唯一能做的就是把「小回包」压成一次 write：
+#   · 小于等于 SMALL_OUT 字节的 stdout / 文件，先 base64 进变量，再 printf 一次整行；
+#   · 更大的才流式（那时 40ms 被几十上百毫秒的总量摊薄，流式省下的 30~50ms 更值）。
+# 阈值可用 DSH_BRIDGE_SMALL_OUT 覆盖，方便基准脚本做 A/B。
+SMALL_OUT=${DSH_BRIDGE_SMALL_OUT:-65536}
+case "$SMALL_OUT" in ''|*[!0-9]*) SMALL_OUT=65536 ;; esac
+
+USE_TIMEOUT=0
+have timeout && USE_TIMEOUT=1
+# --preserve-status 是 GNU coreutils 的扩展（BSD/macOS 的 timeout 没有）。
+# 没有它，被 timeout 杀掉和脚本自己 exit 124 就分不开了，只能退回旧的三层 runner。
+# 探测一次，失败就降级——宁可慢几毫秒，也不要在别家 timeout 上直接报错退出。
+PRESERVE=0
+if [ "$USE_TIMEOUT" = 1 ] && timeout --preserve-status 1 true >/dev/null 2>&1; then
+  PRESERVE=1
+fi
+
+# ── 计时：不 fork ─────────────────────────────────────────────────────────
+# bash 5 的 EPOCHREALTIME 是内建变量。date 一次要 7.96ms（PRoot 下），
+# 一条命令记两次时间就是 16ms —— 比真正执行 true（4.5ms）还贵。
+# 写成「赋值给全局变量」而不是「打印」，连 $( ) 的子 shell fork 也省掉。
+NOW_MS=0
+now_get() {
+  if [ -n "${EPOCHREALTIME:-}" ]; then
+    local t=${EPOCHREALTIME/./}
+    NOW_MS=$(( t / 1000 ))
+    return
+  fi
+  local x
+  x=$(date +%s%3N 2>/dev/null)
+  case "$x" in
+    *N*) NOW_MS=$(( $(date +%s) * 1000 )) ;;
+    *)   NOW_MS=$x ;;
   esac
 }
 
-say "DSH Termux 桥接 agent：目标 $HOST:$PORT，名称 $NAME"
-[ -n "$(command -v timeout 2>/dev/null)" ] || say "提示: 没有 timeout 命令，命令超时不会被强制中断（pkg install coreutils 可补上）"
+# ── 工作目录：只建一次 ───────────────────────────────────────────────────
+# mktemp -d 每次 8.9ms，rm -rf 每次 7.5ms。命令之间是严格串行的，
+# 所以一个进程只需要一个工作目录，用递增序号区分文件，每 32 次统一清一次，
+# 把 rm 摊到每次约 0.2ms。
+WORK=""
+WORK_DIR="${TMPDIR:-/tmp}/dsh-bridge.$$.$RANDOM"
+if mkdir -p "$WORK_DIR" 2>/dev/null; then
+  WORK="$WORK_DIR"
+  trap 'rm -rf "$WORK"' EXIT INT TERM
+else
+  printf '无法创建临时目录 %s\n' "$WORK_DIR" >&2
+  exit 1
+fi
+RUN_SEQ=0
+NEXT_BASE=""
+begin_call() { RUN_SEQ=$(( RUN_SEQ + 1 )); NEXT_BASE="$WORK/j$RUN_SEQ"; }
 
-# ── 单条命令的处理 ────────────────────────────────────────────────────────
-handle_exec() {
-  local id="$1" to="$2" cwd_f="$3" script_f="$4" max="$5"
-  local cwd script dir code out err start end size ob eb trunc timed flag secs wrap run
-  cwd=$(dec "$cwd_f")
-  script=$(dec "$script_f")
+# 早先这里有一个 runner 层：timeout → bash runner.sh → bash 用户脚本，三层 fork。
+# 现在改成 timeout --preserve-status 直接跑用户脚本，省掉中间那层。
+# 为什么不再需要 runner 记退出码文件：--preserve-status 会让 timeout 原样报出
+# 被跑命令的退出码（实测：脚本自己 exit 124 → 124；被 timeout 杀掉 → 128+信号 = 143/137），
+# 所以「自己退 124」和「被 timeout 杀」本来就能从 $? 分开，不用落盘。
+
+say "DSH Termux 桥接 agent：目标 $HOST:$PORT，名称 $NAME"
+[ "$USE_TIMEOUT" = 1 ] || say "提示: 没有 timeout 命令，命令超时不会被强制中断（pkg install coreutils 可补上）"
+
+# ── 执行一条命令（EXEC / EXECRAW 共用的后半段）────────────────────────────
+# 脚本正文已经在 $NEXT_BASE.in 里了，这里只负责跑它并把结果编码回去。
+do_exec() {
+  local id="$1" to="$2" cwd="$3" max="$4"
+  local base="$NEXT_BASE" out="$NEXT_BASE.out" err="$NEXT_BASE.err"
+  local run="$NEXT_BASE.in" code=0 start end size emit ob eb trunc timed secs
+
   case "$max" in ''|*[!0-9]*) max=65536 ;; esac
   [ "$max" -lt 1024 ] && max=1024
 
-  dir=$(mktemp -d "${TMPDIR:-/tmp}/dsh-bridge.XXXXXX" 2>/dev/null) || dir=""
-  if [ -z "$dir" ]; then
-    printf 'RESULT %s 98 0 0 - %s 0\n' "$id" "$(enc '无法创建临时目录')" >&3
-    return
-  fi
-  printf '%s\n' "$script" > "$dir/body.sh"
-  run="$dir/body.sh"
   # cwd 不存在要单独报出来。只用 exit 97 是不够的：用户自己的脚本也可能 exit 97，
-  # 上层没法区分「路径写错了」和「命令真的返回了 97」。所以先自己探一次目录，
-  # 命中就直接回 RESULT 并带上 kind=cwd；wrap.sh 里的 "|| exit 97" 只作为
-  # 检查与执行之间目录被删掉的竞态兜底。
+  # 上层没法区分「路径写错了」和「命令真的返回了 97」。
   if [ -n "$cwd" ] && [ ! -d "$cwd" ]; then
     printf 'RESULT %s 97 0 0 - %s 0 cwd\n' "$id" "$(enc "cwd 不存在或不是目录: $cwd")" >&3
-    rm -rf "$dir" 2>/dev/null
     return
   fi
   if [ -n "$cwd" ]; then
@@ -96,47 +155,134 @@ handle_exec() {
       printf '%q' "$cwd"
       printf ' || exit 97\n'
       printf 'bash '
-      printf '%q' "$dir/body.sh"
+      printf '%q' "$base.in"
       printf '\n'
-    } > "$dir/wrap.sh"
-    run="$dir/wrap.sh"
+    } > "$base.wrap"
+    run="$base.wrap"
   fi
 
   secs=$(( (to + 999) / 1000 ))
   [ "$secs" -lt 1 ] && secs=1
-  # 用 runner 把「命令自己的退出码」写进文件，再让 timeout 包着 runner 跑。
-  # 这样两种情况不会混：命令自己 exit 124（文件里写着 124）vs 被 timeout 杀掉（文件根本没写成）。
-  # 只看 $? 是分不出来的，两者都是 124。
-  cat > "$dir/runner.sh" <<'RUNNER'
-#!/usr/bin/env bash
-bash "$1" >"$2" 2>"$3" </dev/null
-printf '%s' "$?" > "$4"
-RUNNER
-  start=$(now_ms)
+  now_get
+  start=$NOW_MS
   timed=0
-  if have timeout; then
-    timeout -k 5 "$secs" bash "$dir/runner.sh" "$run" "$dir/out" "$dir/err" "$dir/code"
+  # 3>&- 把套接字关掉，不让用户脚本碰它：dsbox 的 fd 3 就是协议流，
+  # 一句 echo x >&3 就能把下一帧的帧头污染成半行垃圾，整条连接从此错位。
+  # 关掉之后用户再写 3 号只会拿到 Bad file descriptor，不会伤到桥。
+  if [ "$USE_TIMEOUT" = 1 ] && [ "$PRESERVE" = 1 ]; then
+    timeout --preserve-status -k 5 "$secs" bash "$run" > "$out" 2> "$err" </dev/null 3>&-
+    code=$?
+  elif [ "$USE_TIMEOUT" = 1 ]; then
+    timeout -k 5 "$secs" bash "$run" > "$out" 2> "$err" </dev/null 3>&-
+    code=$?
   else
-    bash "$dir/runner.sh" "$run" "$dir/out" "$dir/err" "$dir/code"
+    bash "$run" > "$out" 2> "$err" </dev/null 3>&-
+    code=$?
   fi
-  end=$(now_ms)
-  if [ -f "$dir/code" ]; then
-    code=$(cat "$dir/code" 2>/dev/null)
-    case "$code" in ''|*[!0-9]*) code=1 ;; esac
-  else
-    code=124
-    timed=1
+  now_get
+  end=$NOW_MS
+  case "$code" in ''|*[!0-9]*) code=1 ;; esac
+  # 唯一还剩的歧义：脚本自己 kill -TERM 自己的 PID 也是 143，与被 timeout 杀同码。
+  # 用「有没有跑满时限」区分——被 timeout 杀的一定跑到了时限附近，
+  # 自己发信号的通常远早于此。超时统一归一成 124，保持对上层语义稳定。
+  if [ "$USE_TIMEOUT" = 1 ] && [ "$PRESERVE" = 1 ] && [ "$code" -gt 128 ]; then
+    if [ $(( end - start )) -ge $(( secs * 1000 - 150 )) ]; then
+      timed=1
+      code=124
+    fi
   fi
 
-  size=$(wc -c < "$dir/out" 2>/dev/null | tr -d ' ')
-  case "$size" in ''|*[!0-9]*) size=0 ;; esac
+  # 收尾这一段原来无条件跑 4 个外部命令：wc -c、base64、head+base64。
+  # PRoot 下每次 fork 8~10ms，而绝大多数命令的 stderr 是空的、很多连 stdout 都没有，
+  # 这 36ms 全花在给空文件做编码上。现在按需：无 stdout 无 stderr 只付一次 test；
+  # 有 stderr 才编码一次；有 stdout 才编码（写法见下面的 SMALL_OUT 分支）。
+  #
+  # 所以「要不要截断」靠 wc -c 的字节数判断，不靠切字符串看长度。
+  #
+  # ★ 另一条铁律：这段代码里绝不对超长串做全串扫描。
+  #   曾经的 core=${ob%%=*} 对 1.4MB 的串是 O(n²)，75 秒都不返回（1MiB 输出用例就挂在这）。
   trunc=0
-  [ "$size" -gt "$max" ] && trunc=1
-  ob=$(head -c "$max" "$dir/out" 2>/dev/null | b64e); [ -z "$ob" ] && ob='-'
-  eb=$(head -c 65536 "$dir/err" 2>/dev/null | b64e); [ -z "$eb" ] && eb='-'
+  size=0
+  if [ -s "$out" ]; then
+    size=$(wc -c < "$out" 2>/dev/null)
+    case "$size" in ''|*[!0-9]*) size=0 ;; esac
+    [ "$size" -gt "$max" ] && trunc=1
+  fi
+  eb='-'
+  if [ -s "$err" ]; then
+    eb=$(head -c 65536 "$err" | b64pipe)
+    [ -z "$eb" ] && eb='-'
+  fi
 
-  printf 'RESULT %s %s %s %s %s %s %s -\n' "$id" "$code" "$(( end - start ))" "$trunc" "$ob" "$eb" "$timed" >&3
-  rm -rf "$dir" 2>/dev/null
+  # 字段顺序与老版本逐字节一致（RESULT id code elapsed trunc stdout stderr timed hint），
+  # 所以新旧两侧任意组合都互认 —— 变的只是「怎么把 stdout 那几个字节送到套接字」，
+  # 不是协议本身。两条路径都由 SMALL_OUT 这一个常量决定（见文件头部的解释）：
+  #
+  #   小回包 → 一次 write 发完整行。这是绝大多数命令走的路，也是把固定开销
+  #            从 56ms 压回 14ms 的关键：三次 write 会白等 40ms 的延迟 ACK。
+  #   大回包 → 仍然流式。此时总耗时本来就几十上百毫秒，那 40ms 被摊薄，
+  #            而流式省下的 30~50ms（不把几 MB 装进变量）更值。
+  #
+  # 判据是「实际要发多少字节」而不是「文件多大」：截断时只发 max 个字节，
+  # 一个 4MiB 的输出配 64KiB 上限，真正上网的只有 64KiB，一次 write 就够。
+  # （曾用文件大小做判据，截断场景白走三段写，实测多付 36ms。）
+  emit=$size
+  [ "$trunc" = 1 ] && emit=$max
+  if [ "$emit" -le "$SMALL_OUT" ]; then
+    if [ "$size" -eq 0 ]; then
+      ob='-'
+    elif [ "$trunc" = 1 ]; then
+      ob=$(head -c "$max" "$out" | b64pipe)
+    else
+      ob=$(b64pipe < "$out")
+    fi
+    printf 'RESULT %s %s %s %s %s %s %s -\n' \
+      "$id" "$code" "$(( end - start ))" "$trunc" "$ob" "$eb" "$timed" >&3
+  else
+    printf 'RESULT %s %s %s %s ' "$id" "$code" "$(( end - start ))" "$trunc" >&3
+    head -c "$max" "$out" | b64pipe >&3
+    printf ' %s %s -\n' "$eb" "$timed" >&3
+  fi
+
+  # 每 32 次统一清一次，把 rm -rf 的成本摊薄（全局串行，删时不会有别的手上活）。
+  if [ $(( RUN_SEQ % 32 )) = 0 ]; then
+    rm -f "$WORK"/j* 2>/dev/null
+  fi
+}
+
+# 命令替换本身就是一次 fork（PRoot 下 8~10ms），所以能不起子 shell 就别起。
+# cwd 绝大多数时候是空的，帧里写的是占位符 "-"：先比字符串，只有真有内容才去解码。
+# 这一条把「无 cwd 的普通 exec」省下整整一次 fork。
+handle_exec() {
+  local id="$1" to="$2" cwd_f="$3" script_f="$4" max="$5" cwd='' script=''
+  [ "$cwd_f" = '-' ] || cwd=$(dec "$cwd_f")
+  [ "$script_f" = '-' ] || script=$(dec "$script_f")
+  begin_call
+  printf '%s\n' "$script" > "$NEXT_BASE.in"
+  do_exec "$id" "$to" "$cwd" "$max"
+}
+
+# 裸字节脚本：帧头之后紧跟 nbytes 个字节，直接落盘，不做 base64 解码。
+handle_execraw() {
+  local id="$1" to="$2" cwd_f="$3" nbytes="$4" max="$5" cwd='' body='' rc=0
+  [ "$cwd_f" = '-' ] || cwd=$(dec "$cwd_f")
+  case "$nbytes" in ''|*[!0-9]*) nbytes=0 ;; esac
+  begin_call
+  # 收裸字节不用 head -c + wc -c：那是两次 fork，PRoot 下每次 8~10ms，实测这条路径
+  # 光收帧就占 10~13ms。read -N 是 bash 内建（实测 0ms），按字节精确读、不做行归并，
+  # 落盘内容与源逐字节相同（由 test/bridge.test.cjs 的二进制 / 中文 / CRLF 用例守着）。
+  # 两个前提必须同时成立：
+  #   1) LC_ALL=C —— 否则 -N 数的是字符不是字节，带中文的脚本会读多。
+  #   2) 正文里没有 NUL —— NUL 会让 read 提前返回，rc 非 0，下面立刻当作失败处理。
+  IFS= LC_ALL=C read -r -N "$nbytes" body <&3 || rc=$?
+  printf '%s' "$body" > "$NEXT_BASE.in"
+  if [ "$rc" -ne 0 ]; then
+    # 短读（对端提前关）或正文含 NUL。两种情况下这条流里都还剩没读走的字节，
+    # 继续读下一帧只会把残字节当帧头，越错越远；直接断开，交给重连循环重建干净连接。
+    printf 'RESULT %s 96 0 0 - %s 0\n' "$id" "$(enc "脚本正文读取失败（短读或含 NUL 字节），连接将重建")" >&3
+    exit 1
+  fi
+  do_exec "$id" "$to" "$cwd" "$max"
 }
 
 handle_put() {
@@ -173,7 +319,7 @@ handle_putraw() {
   case "$before" in ''|*[!0-9]*) before=0 ;; esac
   # head -c N 的读循环每次 read(MIN(剩余, BUFSIZ))，不会多吃一个字节，
   # 所以紧随其后的下一帧帧头是安全的；对端半路消失时也不会永久阻塞。
-  if have timeout; then
+  if [ "$USE_TIMEOUT" = 1 ]; then
     if [ "$mode" = "a" ]; then
       timeout -k 2 120 head -c "$nbytes" <&3 >> "$path" || code=$?
     else
@@ -197,24 +343,40 @@ handle_putraw() {
   fi
   printf 'RESULT %s %s 0 0 - %s 0\n' "$id" "$code" "$(enc '')" >&3
 }
+
 handle_get() {
-  local id="$1" path_f="$2" max="$3" path size data eb trunc=0 code=0
+  local id="$1" path_f="$2" max="$3" path size emit eb='-' trunc=0 code=0 data='-'
   path=$(dec "$path_f")
   case "$max" in ''|*[!0-9]*) max=8388608 ;; esac
   if [ ! -f "$path" ] || [ ! -r "$path" ]; then
     printf 'DATA %s 3 - %s 0\n' "$id" "$(enc "读不到文件: $path")" >&3
     return
   fi
-  size=$(wc -c < "$path" 2>/dev/null | tr -d ' ')
+  size=$(wc -c < "$path" 2>/dev/null)
   case "$size" in ''|*[!0-9]*) size=0 ;; esac
   [ "$size" -gt "$max" ] && trunc=1
-  data=$(head -c "$max" "$path" | b64e); [ -z "$data" ] && data='-'
-  eb='-'
-  printf 'DATA %s %s %s %s %s\n' "$id" "$code" "$data" "$eb" "$trunc" >&3
+  # 与 do_exec 完全相同的两条路径、同样的理由（见文件头部 SMALL_OUT 的注释）：
+  # 小文件一次 write 发完整行，避开 Nagle 的 40ms 延迟 ACK；大文件才流式，
+  # 免得把 8MiB 的 base64（10.9MB）装进变量。判据同样是「实发字节数」。
+  emit=$size
+  [ "$trunc" = 1 ] && emit=$max
+  if [ "$emit" -le "$SMALL_OUT" ]; then
+    if [ "$trunc" = 1 ]; then
+      data=$(head -c "$max" "$path" | b64pipe)
+    else
+      data=$(b64pipe < "$path")
+    fi
+    [ -z "$data" ] && data='-'
+    printf 'DATA %s %s %s %s %s\n' "$id" "$code" "$data" "$eb" "$trunc" >&3
+  else
+    printf 'DATA %s %s ' "$id" "$code" >&3
+    head -c "$max" "$path" | b64pipe >&3
+    printf ' %s %s\n' "$eb" "$trunc" >&3
+  fi
 }
 
 # ── 主循环：断了就重连，直到被 Ctrl-C ────────────────────────────────────
-# DENY 分两类：认不出的（令牌错、协议不匹配）必须**直接退出**。老版本对所有 DENY
+# DENY 分两类：认不出的（令牌错、协议不匹配）必须直接退出。老版本对所有 DENY
 # 一律 break 然后立刻重连，令牌错时就变成一个 3 秒一次的无限重连循环，进程永远留在
 # 后台 —— 这正是测试里能残留一堆 agent、把后来那次冒烟测试搞脏的原因。
 FIFO_WAIT=90
@@ -239,9 +401,9 @@ while [ "$FATAL" = 0 ]; do
     sleep "$BACKOFF"
     continue
   fi
-  # 第 4 字段是能力声明：服务端据此决定用 PUTRAW(裸字节) 还是老的 PUT(base64)。
+  # 第 4 字段是能力声明：服务端据此决定用 EXECRAW / PUTRAW（裸字节）还是老的 base64。
   # 老服务端会忽略多余字段，所以这条改动对旧版服务端是安全的。
-  printf 'HELLO 1 %s %s raw\n' "$(enc "$TOKEN")" "$(enc "$NAME")" >&3
+  printf 'HELLO 1 %s %s raw,rawx\n' "$(enc "$TOKEN")" "$(enc "$NAME")" >&3
   say "已连接，等待任务…"
 
   silent=0
@@ -299,6 +461,10 @@ while [ "$FATAL" = 0 ]; do
       EXEC)
         IFS=' ' read -r -a F <<< "$rest"
         handle_exec "${F[0]:-}" "${F[1]:-30000}" "${F[2]:--}" "${F[3]:--}" "${F[4]:-65536}"
+        ;;
+      EXECRAW)
+        IFS=' ' read -r -a F <<< "$rest"
+        handle_execraw "${F[0]:-}" "${F[1]:-30000}" "${F[2]:--}" "${F[3]:-0}" "${F[4]:-65536}"
         ;;
       PUT)
         IFS=' ' read -r -a F <<< "$rest"

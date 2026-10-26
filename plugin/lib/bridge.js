@@ -532,12 +532,19 @@ class Bridge extends EventEmitter {
     const maxBytes = clampPayload(Math.min(MAX_OUTPUT_BYTES, Number(opts.maxBytes) || 65536), 65536)
     const agent = await this.#acquire(opts.waitMs)
     const id = nextId('ex')
-    const frame = proto.encodeFrame('EXEC', [
-      id, timeoutMs, proto.encField(opts.cwd || ''), proto.encField(script), maxBytes
-    ])
     const started = nowMs()
     this.totalJobs += 1
-    const result = await this.#roundtrip(agent, id, frame, timeoutMs + GRACE_MS, '执行命令', true)
+    // 裸字节脚本：帧头只声明长度，正文紧跟在换行之后。
+    // 老 agent 不认识 EXECRAW（HELLO 里没声明 rawx），仍然走 base64 那条路。
+    const useRaw = agent.has(proto.CAP_RAW_EXEC)
+    const payload = useRaw ? Buffer.from(script, 'utf8') : null
+    const frame = useRaw
+      ? 'EXECRAW ' + id + ' ' + timeoutMs + ' ' + proto.encField(opts.cwd || '') + ' ' +
+        payload.length + ' ' + maxBytes + '\n'
+      : proto.encodeFrame('EXEC', [
+        id, timeoutMs, proto.encField(opts.cwd || ''), proto.encField(script), maxBytes
+      ])
+    const result = await this.#roundtrip(agent, id, frame, timeoutMs + GRACE_MS, '执行命令', true, payload)
     const totalMs = nowMs() - started
     this.lastJob = { at: new Date().toISOString(), kind: 'exec', exitCode: result.exitCode, timedOut: !!result.timedOut, totalMs }
     return Object.assign(result, { agent: agent.name, agentId: agent.id, timeoutMs, totalMs })

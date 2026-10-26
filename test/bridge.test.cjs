@@ -213,6 +213,30 @@ test('命令自己 exit 124 不算超时（timedOut=false）', async (t) => {
   assert.strictEqual(r.timedOut, false, '自己返回 124 不是我们杀的')
 })
 
+test('用户脚本碰 fd 3 不会污染协议流（连接仍可用）', async (t) => {
+  // 桥把帧写在 fd 3 上。用户脚本里的 `echo x >&3` 本以为只是写个日志，
+  // 实际会往协议流里插半行垃圾，把下一帧的帧头拆散，整条连接从此错位且不自愈。
+  // agent 用 3>&- 把套接字关在子进程之外，所以用户只能拿到 Bad file descriptor。
+  const { bridge } = await boot(t)
+  const r1 = await bridge.exec({ script: 'echo POISON >&3; echo after', timeoutMs: 10000 })
+  assert.strictEqual(r1.ok, true, '写 fd 3 失败不该让整条命令失败')
+  assert.strictEqual(r1.stdout.trim(), 'after')
+  assert.match(r1.stderr, /Bad file descriptor/, '必须真的关掉，而不是静默丢弃')
+  // 关键：桥上还能正常跑下一条命令。
+  const r2 = await bridge.exec({ script: 'echo still-alive', timeoutMs: 10000 })
+  assert.strictEqual(r2.ok, true)
+  assert.strictEqual(r2.stdout.trim(), 'still-alive')
+})
+
+test('用户脚本读 fd 3 吃不到下一帧', async (t) => {
+  const { bridge } = await boot(t)
+  const r = await bridge.exec({ script: 'read -t 1 x <&3; echo got=$x', timeoutMs: 10000 })
+  assert.strictEqual(r.stdout.trim(), 'got=')
+  assert.match(r.stderr, /Bad file descriptor/)
+  const after = await bridge.exec({ script: 'echo final-ok', timeoutMs: 10000 })
+  assert.strictEqual(after.stdout.trim(), 'final-ok')
+})
+
 test('真的掉线时才报 E_AGENT_TIMEOUT', async (t) => {
   const { bridge, child } = await boot(t)
   const pending = bridge.exec({ script: 'sleep 5', timeoutMs: 3000 })
@@ -472,4 +496,3 @@ test('protocol.decodePayload 的单位边界', () => {
   assert.strictEqual(t3.binary, true)
   assert.strictEqual(t3.encoding, 'base64')
 })
-

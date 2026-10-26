@@ -17,7 +17,7 @@
 在 Termux 里跑一次启动脚本，auto 就会自动切过去。
 
 - 包名: @local/dsh-termux-bridge
-- 版本: 1.2.8
+- 版本: 1.2.9
 - 作者: **Azek431（艾泽衡）** — Telegram 频道 [@AzekMain](https://t.me/AzekMain) · Azek431@163.com
 - 许可证: GPL-3.0-only（见 LICENSE / NOTICE）
 - 归属: DSHBox（本仓库自研，不含第三方源码）
@@ -224,29 +224,38 @@ cwd 指向不存在的目录时，命令**根本不会执行**，直接返回 `E
 
 两个执行面用同一套语义，但机制不同：
 
-- agent 侧：用 runner.sh 把「命令自己的退出码」写进文件，再让 timeout 包着 runner 跑。
-  文件里有值 → 命令真的退出过（**哪怕它自己 exit 124**）；文件没写成 → 是被 timeout 杀的。
+- agent 侧（1.2.9 起）：`timeout --preserve-status` **直接**跑用户脚本。`--preserve-status`
+  会原样报出被跑命令的退出码，于是「脚本自己 exit 124」与「被 timeout 杀掉」本来就能从 `$?` 分开
+  （实测：自己 exit 124 → 124；被 timeout 杀 → 128+信号 = 143/137）。剩下唯一的歧义是脚本自己
+  `kill -TERM` 自己也是 143，所以再加一道判据：**`code > 128` 且实际用时已经跑到时限附近**
+  才归一成 exitCode=124 / timedOut=true，保证上层语义稳定。
+  没有 `--preserve-status` 的 `timeout`（BSD / macOS）自动降级到旧路径，只是超时码要额外归一。
 - local 侧：Node 侧计时器到点直接 SIGKILL 整个进程组（detached 起，防孙进程漏网），
   然后统一归到 exitCode=124 / timedOut=true。
 
 只看 $? 会把「命令自己 exit 124」和「被超时杀掉」混成一件事，这是本插件刻意绕开的坑。
+1.2.9 之前 agent 侧是靠一个 runner.sh 把 `$?` 写进文件来区分的（三层 fork）；现在这层已经去掉，
+判据改由 `--preserve-status` 提供。
 
 ---
 
 ## 4. 协议（自定义行帧，纯 bash 可实现）
 
 一行一帧，空格分列；**所有可能含空格的字段一律 base64，空值写 -**。
+`EXECRAW` / `PUTRAW` 是唯一的例外：帧头行之后紧跟裸字节，不是纯行帧（见本节末尾）。
 
-    HELLO  <ver> <token_b64> <name_b64>
+    HELLO  <ver> <token_b64> <name_b64> <caps>
     WELCOME <ver> <host_b64>              |  DENY <code> <text_b64>
     EXEC   <id> <timeout_ms> <cwd_b64|-> <script_b64> <max_bytes>
+    EXECRAW <id> <timeout_ms> <cwd_b64|-> <nbytes> <max_bytes>
     PUT    <id> <w|a> <path_b64> <data_b64>
+    PUTRAW <id> <w|a> <path_b64> <nbytes>
     GET    <id> <path_b64> <max_bytes>
     RESULT <id> <exit> <elapsed_ms> <trunc 0|1> <stdout_b64|-> <stderr_b64|-> <timed_out 0|1> <hint|->
     DATA   <id> <exit> <data_b64|-> <stderr_b64|-> <trunc 0|1>
     PING   <id>  ->  PONG <id>
 
-约束：PROTO_VERSION=1、MAX_LINE_BYTES=16 MiB、MAX_SCRIPT_BYTES=256 KiB。
+约束：PROTO_VERSION=1、MAX_LINE_BYTES=16 MiB、MAX_SCRIPT_BYTES=256 KiB、RAW_CHUNK_BYTES=4 MiB。
 
 RESULT 的第 8 字段 `hint` 是 1.2.8 新加的**裸 ASCII 语义标记**（不是 base64，普通路径写 `-`，
 cwd 不存在写 `cwd`）。它解决的是「97 是谁给的」这个问题，详见第 3 节的「cwd 不存在」小节。老 agent 不发这个字段，
@@ -255,6 +264,22 @@ cwd 不存在写 `cwd`）。它解决的是「97 是谁给的」这个问题，�
 MAX_LINE_BYTES 必须是**载荷上限的 1.33 倍以上**：base64 会膨胀 4/3。这曾经是个真 bug ——
 帧上限和输出上限都设成 1 MiB，于是 maxBytes=1 MiB 时数据帧变成约 1.4 MiB > 1 MiB，
 接收端直接 destroy，调用方看到的是莫名其妙的 E_AGENT_GONE。协议层上限必须显式大于载荷上限。
+
+**裸字节帧（`PUTRAW` 1.2.8 / `EXECRAW` 1.2.9）** 与上面的行帧不是一个形状：帧头行以 `\n` 收尾，
+后面**紧跟 nbytes 个原始字节，没有任何分隔符**。agent 读完帧头那一行就直接 `head -c <nbytes> <&3`
+（`EXECRAW` 用 bash 内建 `read -N`，省掉两次 fork）落盘，不经过 base64。
+
+为什么值得为它多一套帧：**bash 的 `read -u 3` 从 socket 读「一行」是逐字节 `read(2)`** ——
+1 MiB 的 PUT 行要 7206ms，同样大小的裸字节 `head -c` 只要 34ms。脚本正文走 base64 时同理，
+除了逐字节读还要多 fork 两个 `base64 -d`。这不是编码慢，是「按行读」这件事本身慢。
+
+这条通路**必须独占连接**：裸字节流里只要混进一个 `PING` 行，垃圾就会被原样写进文件。
+所以它依赖两个硬前提 —— 桥接侧严格串行派活，以及心跳跳过忙 agent。
+
+能力协商：agent 在 `HELLO` 第 4 字段声明 `raw`（`PUTRAW`）与 `rawx`（`EXECRAW`）。
+老 agent 不声明，桥接侧自动回退到 `PUT` / `EXEC` 的 base64 帧 —— **功能完全等价，只是慢**，
+不会因为版本不同而报错。`RAW_CHUNK_BYTES = 4 MiB`，不受 `MAX_LINE_BYTES` 约束：
+裸字节不是一行，不吃「一行一次 read」的惩罚，1 MiB 与 4 MiB 的文件都各只要一帧。
 
 同端口还兼一个极简 HTTP 面（按首行 GET/HEAD 分流），只回 /agent 与 /agent.sh
 （渲染好占位符的 agent 脚本），其余一律 404 —— 这就是 curl 那一行能拿到脚本的原因。
@@ -276,6 +301,20 @@ local 执行面不走这个协议：它是进程内调用 lib/local.js，直接 
 - **local 超时打进程组**：detached:true + process.kill(-pid)，否则 bash 起了孙进程超时后会漏。
 - **输出上限**：stdout 默认回 64 KiB（maxBytes 可到 1 MiB），stderr 最多 64 KiB；超了置 truncated。
   要更多内容就让执行面先重定向到文件，再用 pull 读。
+- **去掉 runner 层，换 `--preserve-status`**（1.2.9）：原来的链路是
+  `timeout → bash runner.sh → bash 用户脚本`，三层 fork，中间那层只干一件事 —— 把 `$?` 写进文件，
+  好让「自己 exit 124」和「被超时杀」分得开。`timeout --preserve-status` 会原样报出被跑命令的退出码，
+  这件事它自己就做了。代价是 `--preserve-status` 是 GNU 扩展，**BSD / macOS 的 timeout 没有** ——
+  所以探测一次，失败就退回旧的三层路径。宁可慢几毫秒，也不要在别家 timeout 上直接报错退出。
+  这笔账值得算：PRoot 下每次 fork 8~10ms，砍掉一层就是每条命令省下的固定开销的大头。
+- **`3>&-`：把协议套接字关在用户脚本之外**（1.2.9）。dsbox 里 agent 的 fd 3 就是协议流，
+  用户脚本一句 `echo x >&3` 就能往协议里插半行垃圾，把下一帧的帧头拆散，
+  整条连接从此错位且**不自愈**。这个故障最坏的地方是它不报错 —— 表现为后面某条命令莫名超时。
+  关掉之后用户再写 3 号只会拿到 `Bad file descriptor`，错误留在用户自己的脚本里。
+- **不在字符串上做全串手术**（1.2.9）。截断判定原本要对 1.4 MB 的 base64 串取 `${ob%%=*}`，
+  那是 O(n²)，实测 75 秒不返回。改成先看 `${#ob}` 够不够到截断边界（bash 内建，不 fork），
+  够到才 `wc -c` 问一次真实大小。**小输出（99% 的情况）连分支都不进**，
+  大输出也只多一次 fork —— 复杂度从「输出长度的平方」退回「常数」。
 - **令牌**：token 配置留空则每次启动随机生成。换令牌后必须重新取 agent 脚本，否则握手 DENY。
 
 ---
@@ -311,7 +350,7 @@ agent 侧有 --quiet 参数可关掉 stderr 日志。
 
 ## 8. 测试
 
-    node --test test/bridge.test.cjs     # 29 条：协议 / 执行 / push-pull / 二进制编码 / 超时语义 / 大输出 / agent 生命周期 / HTTP 面
+    node --test test/bridge.test.cjs     # 31 条：协议 / 执行 / push-pull / 二进制编码 / 裸字节帧 / fd 3 隔离 / 超时语义 / 大输出 / agent 生命周期 / HTTP 面
     node test/smoke.cjs                  # 冒烟：真加载 profile 里的包，两个执行面各跑一遍
 
 套件约 14 秒跑完并**干净退出**（1.2.6 修掉了此前"20 条全过但进程永不退出"的管道泄漏，见下）。
@@ -320,7 +359,10 @@ bridge.test.cjs 覆盖：握手执行、非零退出码透传、多行/heredoc�
 argv 空格与 $(echo pwn) 不被二次展开、输出截断、超时强杀、命令自己 exit 124 不算超时、
 掉线报错、多片 push/pull 往返、远端建目录、pull 缺失文件、无 agent、错令牌、HTTP 路由、
 **大输出（1 MiB）不被帧上限撕掉连接**、**pull 大文件不被帧上限撕掉连接**（后两条是 1.1.1 的回归）、
-**令牌错时 agent 自己退出而不是无限重连**、**同名 agent 只保留一条且 3 秒内不乒乓**（后两条 1.2.1）。
+**令牌错时 agent 自己退出而不是无限重连**、**同名 agent 只保留一条且 3 秒内不乒乓**（后两条 1.2.1）、
+**用户脚本写 fd 3 不污染协议流**、**用户脚本读 fd 3 吃不到下一帧**（后两条是 1.2.9 的回归：
+`3>&-` 必须真的把套接字关在子进程之外，而不是静默丢弃 —— 两条用例都同时断言
+「拿到 Bad file descriptor」和「桥上还能正常跑下一条命令」，缺任何一半都测不出真问题）。
 
 两条与"环境隔离"有关的约定，改测试时别弄丢：
 
