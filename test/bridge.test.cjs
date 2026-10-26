@@ -40,6 +40,27 @@ function waitFor (fn, ms, label) {
   })
 }
 
+// 把 spawn 出来的 agent 连它的整个进程组一起收掉，并等它真的退出。
+// 只 kill 单个 pid 会留下孤儿（PPID 变 1）继续握着管道写端。
+function killTree (child, timeoutMs = 5000) {
+  return new Promise((resolve) => {
+    if (!child || child.exitCode !== null || child.signalCode !== null) return resolve()
+    let settled = false
+    const done = () => { if (!settled) { settled = true; clearTimeout(timer); resolve() } }
+    const timer = setTimeout(() => {
+      // 进程组杀不掉的极端情况，直接按 pid 补一刀
+      try { child.kill('SIGKILL') } catch {}
+      done()
+    }, timeoutMs)
+    child.once('exit', done)
+    try {
+      process.kill(-child.pid, 'SIGKILL') // 负号 = 整个进程组
+    } catch {
+      try { child.kill('SIGKILL') } catch {}
+    }
+  })
+}
+
 async function boot (t, overrides) {
   const { renderAgentScript } = require('../plugin/lib/index.js')
   const bridge = new Bridge(Object.assign({ port: 0 }, overrides))
@@ -64,14 +85,24 @@ async function boot (t, overrides) {
 
   // MAX_FAIL=1：连不上就自杀。否则 DSH 侧一断，这个 bash 会永远重连下去，
   // 测试进程被 kill 之后它还活着，下次跑别的用例就能被它混进来。
+  // detached:true 让 agent 自成进程组，收尾时能整组杀掉（连同它 fork 出的 timeout 等子进程）。
+  // 否则 agent 会被 kill 之后仍以 PPID=1 存活，并继续持有我们这两个管道的写端，
+  // 导致 Node 事件循环永远不空 —— 表现为「20 个用例全过但进程不退出」。
   const child = spawn('bash', [scriptPath], {
     stdio: ['ignore', 'pipe', 'pipe'],
+    detached: true,
     env: Object.assign({}, process.env, { DSH_BRIDGE_MAX_FAIL: '1' })
   })
-  t.after(() => { try { child.kill('SIGKILL') } catch {} })
+  // 主动释放管道读端，收尾时再 destroy 一次，双保险。
+  child.stdout.resume()
   let stderrLog = ''
   child.stderr.setEncoding('utf8')
   child.stderr.on('data', (c) => { stderrLog += c })
+  t.after(async () => {
+    await killTree(child)
+    try { child.stdout.destroy() } catch {}
+    try { child.stderr.destroy() } catch {}
+  })
   t.after(() => { try { fs.rmSync(dir, { recursive: true, force: true }) } catch {} })
 
   await waitFor(() => bridge.status().agents > 0, 8000, 'agent 握手 (stderr: ' + stderrLog + ')')

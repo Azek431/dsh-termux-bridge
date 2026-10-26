@@ -17,7 +17,7 @@
 在 Termux 里跑一次启动脚本，auto 就会自动切过去。
 
 - 包名: @local/dsh-termux-bridge
-- 版本: 1.2.5
+- 版本: 1.2.6
 - 作者: **Azek431（艾泽衡）** — Telegram 频道 [@AzekMain](https://t.me/AzekMain) · Azek431@163.com
 - 许可证: GPL-3.0-only（见 LICENSE / NOTICE）
 - 归属: DSHBox（本仓库自研，不含第三方源码）
@@ -208,7 +208,7 @@ agent 侧有 --quiet 参数可关掉 stderr 日志。
     node --test test/bridge.test.cjs     # 20 条：协议 / 执行 / push-pull / 超时语义 / 大输出 / agent 生命周期 / HTTP 面
     node test/smoke.cjs                  # 冒烟：真加载 profile 里的包，两个执行面各跑一遍
 
-注意 node --test 跑完可能不退出（定时器未 unref），后台跑再 tail 日志，别前台等。
+套件约 14 秒跑完并**干净退出**（1.2.6 修掉了此前"20 条全过但进程永不退出"的管道泄漏，见下）。
 
 bridge.test.cjs 覆盖：握手执行、非零退出码透传、多行/heredoc、cwd、cwd 不存在（exit 97）、
 argv 空格与 $(echo pwn) 不被二次展开、输出截断、超时强杀、命令自己 exit 124 不算超时、
@@ -222,6 +222,13 @@ argv 空格与 $(echo pwn) 不被二次展开、输出截断、超时强杀、�
   agent 带着同一个令牌会自动接进下一轮，把"起手 0 个 agent"断言打成假的。
 - **spawn 出来的 agent 必须带 `DSH_BRIDGE_MAX_FAIL=1`**，让它连不上就自杀，
   否则测试进程被 kill 之后它还在后台重连，几小时后还能污染别的用例。
+- **收尾必须按进程组杀，不能只 kill 单个 pid**。`spawn` 时带 `detached: true`，
+  `t.after` 里调 `killTree(child)`——它发 `process.kill(-child.pid, 'SIGKILL')`
+  （负号 = 整个进程组，连同 agent 自己 fork 出的 `timeout` 等子进程），并 `await`
+  它的 `exit`，最后 `destroy()` 掉 stdout/stderr 管道。1.2.5 之前只 `child.kill('SIGKILL')`，
+  agent 变成 PPID=1 的孤儿并**继续握着这两个管道的写端**，Node 事件循环永远不空：
+  表现为 `tests 21 / pass 20 / cancelled 1`、duration 卡满 timeout 才被杀（EXIT=124），
+  而文件里其实只有 20 个 `test()`，"第 21 个"是整个进程没退出。
 
 smoke.cjs 覆盖：无 agent 时 auto 落 local、local 执行/退出码/超时/cwd 缺失/push-pull、
 强制 termux 无 agent 报 E_NO_AGENT、非法 backend 报 E_INVALID_ARGUMENT、

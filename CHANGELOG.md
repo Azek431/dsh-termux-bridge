@@ -2,6 +2,31 @@
 
 本项目遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [1.2.6] —— 2026-10-26
+
+修掉测试套件的进程泄漏：**20 条用例全过，但进程永不退出**。之前一直靠 `timeout` 硬杀，
+所以 CI 里看着是绿的，其实每条流水线都在白等满 250 秒。
+
+### 修复
+
+- **测试收尾留下孤儿 agent，握着管道写端导致事件循环不空**。`boot()` 里 `spawn` 出 agent 后
+  只做了 `child.kill('SIGKILL')`：agent 变成 PPID=1 的孤儿**继续持有 spawn 时那两条 stdio 管道**，
+  Node 认为还有活跃句柄，进程就永远不退出。现象很有欺骗性——`node --test` 报
+  `tests 21 / pass 20 / fail 0 / cancelled 1`，duration 卡到 timeout 被杀，
+  可文件里明明只有 20 个 `test()`：那个「第 21 个」是文件级伪用例，即整个进程没能收场。
+  修法三处：`spawn` 加 `detached: true`；`t.after` 改为 `await killTree(child)`，内部发
+  `process.kill(-child.pid, 'SIGKILL')` 按**进程组**收整棵树（连同 agent fork 的 `timeout`），
+  并 `await` 它的 `exit`；最后显式 `destroy()` stdout/stderr。
+- **副作用兜底**：`killTree` 带 5 秒超时，进程组杀不掉时按 pid 补一刀，避免收尾自己挂住。
+
+### 已验证
+
+- `node --test test/bridge.test.cjs` → **tests 20 / pass 20 / fail 0 / cancelled 0**，
+  **duration 13.7s，进程自然退出（EXIT=0）**，不再需要 `timeout` 兜底。
+- 同时清理了历史遗留的三个孤儿 `bash /tmp/dsh-bridge-test-*/agent.sh`。
+- README 第 8 节更新：删掉「跑完可能不退出，后台跑再 tail 日志」的旧提醒，
+  并把「按进程组杀 + await exit + destroy 管道」写进「环境隔离约定」，作为改测试时的硬约束。
+
 ## [1.2.5] —— 2026-10-26
 
 首次真正跑通发布流程（`Azek431/dsh-termux-bridge` 上线）时暴露的三个 bug。
