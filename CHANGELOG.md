@@ -2,6 +2,37 @@
 
 本项目遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [1.2.5] —— 2026-10-26
+
+首次真正跑通发布流程（`Azek431/dsh-termux-bridge` 上线）时暴露的三个 bug。
+前两个是同一类错误：把环境变量赋值写在了命令**后面**，bash 会把它们当成参数传给
+被调用的程序，而不是设进环境。写的时候看不出来，只有在真机上跑一次才会炸。
+
+### 修复
+
+- **建仓请求体为空（`KeyError: N`）**。原写法
+  `python3 -c '...os.environ["N"]...' N="$NAME" P="$PRIVATE" D="$DESC"` 把三项赋值当成了
+  python 的位置参数，`os.environ` 里根本没有 `N`，建仓直接抛 `KeyError`。改为把赋值前置：
+  `N=... P=... D=... python3 -c '...'`。
+- **topic 一个都没写进去（`KeyError: T`）**。同一个错误，循环里 `..." T="$t"` 同样无效，
+  8 个 topic 全部静默失败（`>/dev/null || true` 把错误吞了，所以更隐蔽）。
+  顺便**重构掉逐条读改写**：原来是「读取现有 topics → 追加一个 → PUT 回去」循环 8 次，
+  既慢又会在中途失败时留下半成品；改成一次 PUT 全量覆盖，并用 `printf | tr | python3`
+  拼 JSON 数组。
+- **网络瞬断让整个流程前功尽弃**。建仓时遇到 `curl: (56) Recv failure: Software caused
+  connection abort`，脚本直接退出 —— 但其实仓库已经在服务端建好了，只是响应半路断了。
+  三处加固：`auth_api()` 统一加 `--retry 4 --retry-delay 2 --retry-all-errors --max-time 40`；
+  建仓响应拿不到时**回查一次** `GET /repos/{owner}/{repo}`，存在就继续而不是报失败；
+  首次 `git push` 失败自动重试一次。
+
+### 已验证
+
+- `https://github.com/Azek431/dsh-termux-bridge` 可访问，21 个文件全部到位，默认分支 `main`，
+  3 个 commit 作者均为 `Azek431`。
+- 仓库元数据：description / homepage（`deepseek-ai/deepseek-harness`）/ license `GPL-3.0` /
+  8 个 topic 全部生效。
+- 脚本重跑幂等：第二次执行正确打印「仓库已存在，跳过创建」与「Everything up-to-date」。
+
 ## [1.2.4] —— 2026-10-26
 
 ### 新增

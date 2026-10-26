@@ -17,7 +17,7 @@
 在 Termux 里跑一次启动脚本，auto 就会自动切过去。
 
 - 包名: @local/dsh-termux-bridge
-- 版本: 1.2.4
+- 版本: 1.2.5
 - 作者: **Azek431（艾泽衡）** — Telegram 频道 [@AzekMain](https://t.me/AzekMain) · Azek431@163.com
 - 许可证: GPL-3.0-only（见 LICENSE / NOTICE）
 - 归属: DSHBox（本仓库自研，不含第三方源码）
@@ -243,6 +243,14 @@ DSH 跑在 proot 客人里，它的 `$HOME` 是客人的 `/root`，与 Termux �
 所以仓库源码放在 Android 共享存储
 （`/storage/emulated/0/编程/DeepSeek-Hermes/插件/dsh-termux-bridge`），
 **两边看到的是同一个目录**，在 Termux 里直接推即可，不需要拷贝。
+
+**当前状态：已发布 → <https://github.com/Azek431/dsh-termux-bridge>**
+
+本仓库的首次发布实际走的是下面的「零交互 token 路径」：在 DSH 客人里用 GitHub
+Device Flow 拿到 token（`POST /login/device/code` → 用户在任意浏览器点 Authorize →
+轮询 `POST /login/oauth/access_token`），再交给 `scripts/push-with-token.sh` 建仓推送。
+全程没有依赖 Termux 侧的 `gh` 登录态 —— 因为客人根本读不到 Termux 的 `~/.config/gh`
+（两个 `$HOME` 不相通）。
 
 **一条命令**
 

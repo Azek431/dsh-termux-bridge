@@ -31,7 +31,11 @@ command -v curl >/dev/null || die "缺 curl：pkg install curl"
 command -v git  >/dev/null || die "缺 git：pkg install git"
 
 API="https://api.github.com"
-auth_api() { curl -sS -H "Authorization: Bearer $TOKEN" -H 'Accept: application/vnd.github+json' -H 'X-GitHub-Api-Version: 2022-11-28' "$@"; }
+# 这类设备上网络瞬断很常见（curl 56 "Software caused connection abort"）。
+# 统一加重试，不让一次抖动把整个流程打断。
+auth_api() { curl -sS --max-time 40 --retry 4 --retry-delay 2 --retry-all-errors \
+  -H "Authorization: Bearer $TOKEN" -H 'Accept: application/vnd.github+json' \
+  -H 'X-GitHub-Api-Version: 2022-11-28' "$@"; }
 
 say "校验 token ..."
 LOGIN="$(auth_api "$API/user" | python3 -c 'import sys,json; d=json.load(sys.stdin); print(d.get("login") or "")' 2>/dev/null || true)"
@@ -51,11 +55,17 @@ if [ "$code" = 200 ]; then
   say "仓库 $FULL 已存在，跳过创建"
 else
   say "创建仓库 $FULL (private=$PRIVATE) ..."
-  body="$(python3 -c 'import json,os;print(json.dumps({"name":os.environ["N"],"private":os.environ["P"]=="true","description":os.environ["D"],"homepage":"https://github.com/deepseek-ai/deepseek-harness","has_issues":True,"has_wiki":False,"auto_init":False}))' \
-    N="$NAME" P="$PRIVATE" D="DSH ⇄ Termux 双执行面桥接插件：让 DeepSeek Harness 在受限沙盒里也能执行命令、传文件、起 agent")"
-  out="$(auth_api -X POST "$API/user/repos" -d "$body")"
-  echo "$out" | grep -q '"full_name"' || { echo "$out" >&2; die "建仓失败"; }
-  say "仓库已建：$FULL"
+  DESC="DSH ⇄ Termux 双执行面桥接插件：让 DeepSeek Harness 在受限沙盒里也能执行命令、传文件、起 agent"
+  body="$(N="$NAME" P="$PRIVATE" D="$DESC" python3 -c 'import json,os;print(json.dumps({"name":os.environ["N"],"private":os.environ["P"]=="true","description":os.environ["D"],"homepage":"https://github.com/deepseek-ai/deepseek-harness","has_issues":True,"has_wiki":False,"auto_init":False}))')"
+  out="$(auth_api -X POST "$API/user/repos" -d "$body" || true)"
+  if echo "$out" | grep -q '"full_name"'; then
+    say "仓库已建：$FULL"
+  elif [ "$(auth_api -o /dev/null -w '%{http_code}' "$API/repos/$FULL" 2>/dev/null || echo 000)" = 200 ]; then
+    # 建仓其实已生效，只是响应在半路断了
+    say "仓库已建（响应中途断开，回查确认存在）：$FULL"
+  else
+    echo "$out" >&2; die "建仓失败"
+  fi
 fi
 
 # ---- 2. 推代码 ----
@@ -67,20 +77,20 @@ git remote get-url origin >/dev/null 2>&1 && git remote set-url origin "https://
 git branch -M main
 say "推送 main ..."
 # 用一次性 credential helper 传 token，避免写进 .git/config 或 URL
-git -c credential.helper= -c "credential.helper=!f() { echo username=x-access-token; echo password=$TOKEN; }; f" \
-    push -u origin main || die "推送失败（token 需要有 repo 权限）"
+push_once() {
+  git -c credential.helper= -c "credential.helper=!f() { echo username=x-access-token; echo password=$TOKEN; }; f" \
+      push -u origin main
+}
+push_once || { say "首次推送中断，重试一次 ..."; push_once || die "推送失败（token 需要有 repo 权限）"; }
 say "推送完成"
 
 # ---- 3. 补元数据 ----
-say "补 topics 与 homepage ..."
-for t in dsh-plugin dsh deepseek-harness termux android proot bridge remote-exec; do
-  auth_api -X PUT "$API/repos/$FULL/topics" \
-    -d "$(auth_api "$API/repos/$FULL/topics" | python3 -c "
-import sys,json,os
-cur=json.load(sys.stdin).get('names',[])
-t=os.environ['T']
-print(json.dumps({'names':sorted(set(cur+[t]))}))" T="$t")" >/dev/null || true
-done
+say "补 topics ..."
+# 一次 PUT 全量覆盖即可，不必逐个读改写（逐个读改写既慢又容易半路失败）
+TOPICS="dsh-plugin dsh deepseek-harness termux android proot bridge remote-exec"
+tcode="$(auth_api -o /dev/null -w '%{http_code}' -X PUT "$API/repos/$FULL/topics" \
+  -d "{\"names\":[$(printf '%s' "$TOPICS" | tr ' ' '\n' | python3 -c 'import sys,json;print(",".join(json.dumps(l.strip()) for l in sys.stdin if l.strip()))')]}" || echo 000)"
+if [ "$tcode" = 200 ]; then say "topics 已写入"; else say "topics 写入失败(HTTP $tcode)，可稍后手动补"; fi
 
 echo
 say "完成 → https://github.com/$FULL"
