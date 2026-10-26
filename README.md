@@ -17,7 +17,7 @@
 在 Termux 里跑一次启动脚本，auto 就会自动切过去。
 
 - 包名: @local/dsh-termux-bridge
-- 版本: 1.2.6
+- 版本: 1.2.7
 - 作者: **Azek431（艾泽衡）** — Telegram 频道 [@AzekMain](https://t.me/AzekMain) · Azek431@163.com
 - 许可证: GPL-3.0-only（见 LICENSE / NOTICE）
 - 归属: DSHBox（本仓库自研，不含第三方源码）
@@ -61,33 +61,92 @@ DSH 跑在 App 的 **PRoot 客人**里。这个客人：
 
 装完**重启 dsh**。工具列表里会多出 6 个 termux_* 工具。
 
-install.sh 的事务顺序（照抄 mobile-pilot 的骨架）：
+### 2.1 装法：vendor 目录 + link: 依赖（1.2.7 起）
+
+1.2.6 及之前，install.sh 是**手工把包目录拷进 `node_modules/@local/`、但不在 `package.json`
+里声明它**。这种"幽灵依赖"会被任何一次 `pnpm install` / `pnpm add` / `pnpm prune`
+（包括在 GUI 里装别的插件）当垃圾静默剪掉 —— 目录没了、bundles 还记着它，下次重启 dsh
+插件就凭空消失，而且报错只说 bundle 解析不到，看不出是 pnpm 干的。
+
+1.2.7 改成**有声明**的布局：
+
+    <profile>/local-plugins/@local/dsh-termux-bridge      ← 包体（vendor 目录，真实目录）
+    <profile>/node_modules/@local/dsh-termux-bridge       ← 软链 → ../../local-plugins/@local/dsh-termux-bridge
+    <profile>/package.json  dependencies:
+      "@local/dsh-termux-bridge": "link:./local-plugins/@local/dsh-termux-bridge"
+
+链接型依赖不被 pnpm 重建，所以 `pnpm install` / `pnpm add` / `--frozen-lockfile` 之后软链都原样存活。
+相对路径让它不依赖共享存储是否挂载，也不依赖绝对路径。
+
+install.sh 的事务顺序：
 
 1. 预检：python3 在不在、必需文件齐不齐、profile 的 dsh.profile.bundles 是不是 list；
-2. 复制到阶段目录 node_modules/@local/.dsh-termux-bridge-stage.<pid>，在阶段目录上跑
+2. 复制到阶段目录 local-plugins/@local/.dsh-termux-bridge-stage.<pid>，在阶段目录上跑
    node --check（四个 JS）与 bash -n（agent 脚本）以及文件清单核对；
-3. 旧包整体挪进备份位 → 新包改名上位 → 发布后复检清单；
+3. 旧包整体挪进备份位 → 新包改名上位 → 建 node_modules 软链 → 发布后复检清单；
 4. 往 dsh.profile.bundles 追加 @local/dsh-termux-bridge（临时文件 + 原子改名）；
-5. 写 .dsh-termux-bridge-install.json 所有权清单。
+5. 在 dependencies 里声明 link: 依赖（记下原值，供失败时还原）；
+6. 更新 pnpm-lock.yaml。**用 `pnpm install --lockfile-only --offline`：链接型依赖不访问
+   registry，所以整个安装过程不需要网络**；
+7. 写 .dsh-termux-bridge-install.json 所有权清单（含 `layout: "vendor-link"`）。
 
-任一步失败：首装则撤半包 + 摘 bundle 条目；升级则把旧包放回原位（旧版保持可用）。
+任一步失败都完整回滚：包体移回、软链按原样重建（旧版是软链就重建软链、是实体目录就移回备份）、
+依赖声明还原、lockfile 覆盖回旧版；**首装失败还会把本次登记的 bundle 条目一并摘掉**，
+profile 回到安装前的状态。判据是装之前有没有旧版（`HAD_PREV`），不是"备份位还在不在"。
+
 **这条链路不是原子操作，重装/升级前先停 dsh。**
 
-### 2.1 装完之后请跑一次自检（重要）
+### 2.2 从 1.2.6 及更早版本升级
 
-DSH 的 profile 用 pnpm 管理依赖，而本插件是**手工装配**进去的：目录被 `mv` 到
-`node_modules/@local/`、bundle 条目被追加进 `package.json`，但它**不在 `dependencies` 里**。
-于是任何一次 `pnpm install` / `pnpm add` / `pnpm prune`（包括在 GUI 里装别的插件）
-都会把它当幽灵依赖删掉 —— 目录没了，bundles 还记着它，下一次重启 dsh 时插件静默消失。
+直接跑 `bash install.sh` 即可，无需先卸载。安装器会检测到 node_modules 里是**实体目录**
+（旧装法），把它挪进 `nmbackup.<pid>` 备份位，再按新布局装；失败会自动移回去。
 
-    bash scripts/ensure-installed.sh --check   # 只自检：列出 @local 下缺失的包，缺失则退出码 1
-    bash scripts/ensure-installed.sh           # 自检 + 自动重跑对应安装器补回来
+卸载也认得两种布局：`uninstall.sh` 会四处一起收 —— bundle 条目 → dependencies 里的 `link:`
+声明 → node_modules 软链（或旧实体目录）→ vendor 包体，最后重算 lockfile，不留悬空声明。
 
-脚本同时覆盖本插件与同机的 `dsh-mobile-adapt` / `mobile-pilot` / `browser-use`
-（三者路径可用 `DSHBOX` 环境变量覆盖）。补装完成后仍需重启 dsh。
+### 2.3 自检脚本（可选）
 
-建议：**每次通过 GUI 装/升级任何插件之后跑一次 `--check`**，或者在收工前跑一次。
+`scripts/ensure-installed.sh` 仍然可用，但现在它主要是给**同机的其它插件**
+（`dsh-mobile-adapt` / `mobile-pilot` / `browser-use`）做幽灵依赖自检 ——
+本插件 1.2.7 起已有正式依赖声明，不再需要它兜底。
 
+    bash scripts/ensure-installed.sh --check   # 只自检，缺失则退出码 1
+    bash scripts/ensure-installed.sh           # 自检 + 重跑对应安装器补回来
+
+### 2.4 ⚠️ 跑 pnpm install 会顺手删掉同机的旧装法插件
+
+**这是实测踩到过的坑，不是理论风险。** 本插件 1.2.7 起有正式依赖声明，`pnpm install` 动不了它；
+但同机的 `@local/dsh-mobile-adapt`、`@local/mobile-pilot`、`@local/browser-use` 仍是**旧装法**
+（把包目录直接放进 `node_modules/@local/`，`package.json` 里只有 bundle 条目、没有 `dependencies` 声明）。
+`pnpm` 一跑就把它们当幽灵依赖清掉：
+
+    $ pnpm install --frozen-lockfile      # 在 profile 目录里
+    $ ls node_modules/@local/
+    dsh-termux-bridge                     # ← 另外三个没了
+    $ dsh --profile web --dump-config
+    dsh: skipping profile bundle "@local/dsh-mobile-adapt": cannot resolve ...
+
+**症状的隐蔽之处**：正在运行的 dsh 进程早已把插件加载进内存，所以 `phone_*` 等工具当场还能用；
+**只有下一次重启才会集体消失**，而且报错只说"解析不到 bundle"，看不出是 pnpm 干的。
+
+恢复办法（各自重跑安装器）：
+
+    bash /root/projects/.dsh/dshbox/dshbox-plugins/mobile-pilot/install.sh
+    bash /root/projects/.dsh/dshbox/dshbox-plugins/mobile-adapt/install.sh
+    bash /root/projects/.dsh/dshbox/dshbox-plugins/browser-use/install.sh /root/projects/.dsh/profiles/web
+
+注意 `browser-use` 的安装器**必须带 profile 目录参数**（其它两个不用），少了会报
+`Browser adapter: profile directory is unavailable`。
+
+验收集：
+
+    dsh --profile web --dump-config | grep -E '^# == @local/'
+
+应当列出四个：`dsh-mobile-adapt` / `mobile-pilot` / `browser-use` / `dsh-termux-bridge`。
+
+另外注意 `dsh` 不在客人 shell 的默认 PATH 里，要么用
+`/root/projects/.dsh/dshbox/bin/dsh`，要么先把该目录加进 PATH —— 否则
+`dsh ... | grep ...` 会静默返回空（`command not found` 被管道吞掉），很容易被误判成"插件没被加载"。
 ---
 
 ## 3. 工具

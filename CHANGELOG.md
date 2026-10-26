@@ -2,6 +2,66 @@
 
 本项目遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [1.2.7] —— 2026-10-26
+
+把 `@local/dsh-termux-bridge` 从「幽灵目录」变成**有声明的依赖**。
+
+1.2.6 及之前，`install.sh` 是手工把包目录拷进 `node_modules/@local/`，**从不在 profile 的
+`package.json` 里声明它**。后果是：任何一次 `pnpm install`（升级别的包、清缓存、CI 重建）
+都会把这个目录当垃圾静默剪掉，插件凭空消失，而且事后极难看出原因 —— 报错只说 bundle 解析不到，
+没人会想到是 pnpm 干的。
+
+### 新增
+
+- **改用 vendor 目录 + `link:` 依赖**：包体放在 profile 的
+  `local-plugins/@local/dsh-termux-bridge`，`node_modules/@local/dsh-termux-bridge` 只是指向它的软链，
+  `package.json` 里正式声明 `"@local/dsh-termux-bridge": "link:./local-plugins/@local/dsh-termux-bridge"`。
+  实测 `pnpm install`、`pnpm add <新包>`、`pnpm install --frozen-lockfile` 之后软链都原样存活。
+- **全程离线**：更新 `pnpm-lock.yaml` 用 `pnpm install --lockfile-only --offline`。链接型依赖不访问
+  registry，所以安装不需要网络。
+- **`uninstall.sh` 四处一起收**：bundle 条目 → `dependencies` 里的 `link:` 声明 → `node_modules` 软链 →
+  vendor 包体，再重算 lockfile，不留指向不存在路径的悬空声明。
+- **兼容 1.2.6 旧装法**：检测到 `node_modules` 里是实体目录时，把它挪进备份位再升级；
+  卸载时也认得这种旧布局。
+
+### 修复
+
+- **回滚把「升级」误判成「首装」**。`cleanup()` 原本用 `[ ! -e "$BACKUP" ]` 判断本次是否首装，
+  但这段代码前面几行刚把 `BACKUP` 移回 `VENDOR`，所以条件**永远为真** —— 升级失败时会走首装分支，
+  把 bundle 条目摘掉、软链删掉，可包体已经还原、依赖声明也没撤，留下一个「文件都在但插件加载不到」的
+  矛盾状态。改为用 `HAD_PREV` 显式记下「装之前有没有旧版」。
+- **旧版是软链时回滚不补链**：原逻辑只 `rm -f "$LINK"`，失败后 node_modules 入口就永久消失了。
+  新增 `LINK_KIND`（`sym` / `dir`），回滚时按原样还原 —— 软链就重建软链，实体目录就移回备份。
+
+### 已验证（各失败分支全部实测）
+
+- 全新安装 → `pnpm install` / `pnpm add`：软链存活、`require.resolve` 通过。
+- 幂等重装：无残留临时位、bundles 不重复。
+- 卸载：五项残留检查全 False、之后 `pnpm install` 不报错。
+- 从 1.2.6 旧装法升级：实体目录 → 软链、旧内容不残留、无重复 bundle 条目。
+- 首装失败（校验阶段就挂）：回到装之前，无包体 / 无软链 / 无声明 / 无 bundle 条目。
+- 升级失败（包已发布后挂）：包体、lockfile、软链、依赖声明全部还原。
+- 旧装法升级失败：还原成 1.2.6 的实体目录，内容逐字节一致。
+
+### 实测记录（真实 profile）
+
+- 装进 `/root/projects/.dsh/profiles/web` 后：软链指向 `local-plugins/`、依赖声明为 `link:./local-plugins/@local/dsh-termux-bridge`、`require.resolve` 正常。
+- 紧接着在同一个 profile 跑 `pnpm install --frozen-lockfile`（Done in 1.5s）后**软链原样存活**，幽灵依赖问题彻底解决。
+- `node --test test/bridge.test.cjs` → 20 passed / 0 failed；`node test/smoke.cjs` → SMOKE OK。
+
+### 顺带发现的连带风险（已写进 README 2.4）
+
+跑 `pnpm install` 时，**同机用旧装法的插件会被一起清掉**。本次实测中 `@local/dsh-mobile-adapt`、
+`@local/mobile-pilot`、`@local/browser-use` 三个目录当场消失（它们只有 bundle 条目、没有 `dependencies` 声明）。
+最阴的是：dsh 进程里早已加载过这些插件，所以当场的工具列表照旧可用，**要等下一次重启才集体失踪**，
+日志只写「cannot resolve profile bundle」，完全看不出是 pnpm 干的。三者的恢复办法是各自重跑安装器
+（`browser-use` 的安装器**必须带 profile 目录参数**，否则退出 1）。
+
+### 工具坑
+
+- 用 `dsh ... | grep ...` 判断插件是否加载**不可靠**：`dsh` 不在客人 shell 的默认 PATH 里，
+  `command not found` 会被管道吞掉，grep 静默返回空，看起来就像「插件没加载」。
+  正确写法是绝对路径 `/root/projects/.dsh/dshbox/bin/dsh --profile web --dump-config`。
 ## [1.2.6] —— 2026-10-26
 
 修掉测试套件的进程泄漏：**20 条用例全过，但进程永不退出**。之前一直靠 `timeout` 硬杀，
