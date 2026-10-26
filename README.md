@@ -17,7 +17,7 @@
 在 Termux 里跑一次启动脚本，auto 就会自动切过去。
 
 - 包名: @local/dsh-termux-bridge
-- 版本: 1.2.3
+- 版本: 1.2.4
 - 作者: **Azek431（艾泽衡）** — Telegram 频道 [@AzekMain](https://t.me/AzekMain) · Azek431@163.com
 - 许可证: GPL-3.0-only（见 LICENSE / NOTICE）
 - 归属: DSHBox（本仓库自研，不含第三方源码）
@@ -255,6 +255,10 @@ cd /storage/emulated/0/编程/DeepSeek-Hermes/插件/dsh-termux-bridge
 bash scripts/push-to-github.sh
 ```
 
+> **`gh auth login` 那一步卡住不动？** 别反复重试，先跳到本节后面的
+> 「如果清了代理还是卡住」——那条路用 `scripts/push-with-token.sh`，
+> 只要一个 token，零交互、不需要 gh。
+
 `scripts/push-to-github.sh` 会做：
 
 1. 检查 `git` / `gh` 是否安装、`gh` 是否已登录（未登录直接给出下一步命令）；
@@ -306,14 +310,46 @@ gh auth login
 
 注：`gh auth setup-git` 之后 git 用 gh 的凭据，`GIT_TERMINAL_PROMPT` 主要影响没用 helper 时的兜底行为。
 
-**兜底：完全不想折腾浏览器授权，就用 token**
+**如果清了代理还是卡住 —— 那就不是网络问题，是交互问题**
 
-```bash
-# 在 GitHub 网页 Settings → Developer settings → Personal access tokens 建一个带 repo scope 的 token
-echo "<你的token>" | gh auth login --with-token --hostname github.com
-gh auth setup-git
+实测（同一台设备，2026-10-26）：直连 GitHub **完全正常** —— 
+`POST https://github.com/login/device/code` 返回 HTTP/2 200、`user_code` 正常生成、
+`expires_in 899 / interval 5`；`curl https://github.com` 也是 200。
+但 `gh auth login` 照样会停在交互层：它把 device code 打出来之后，要求你在**同一个 TTY**里
+按回车、切到前台开浏览器、再切回来接着读；Termux 里这条路径很容易莫名僵住
+（尤其配合物理键盘/剪贴板/前台切换时）。
+
+**所以判断口诀是**：代理变量清空、端口全 closed、`curl https://github.com` 返回 200，
+但 `gh auth login` 依然不动 ⇒ 别再挖网络了，直接换掉交互 —— 用下面的 token 路径。
+
+**零交互路径：`scripts/push-with-token.sh`**
+
+只依赖 `curl` + `git`，**连 `gh` 都不需要**，不读 TTY、不问任何问题：
+
+```
+# 1) 建 token：https://github.com/settings/tokens
+#    Fine-grained → All repositories → Contents: Read and write + Administration: Read and write
+#    或经典 token → 勾 repo
+# 2) 推（推荐从 stdin 喂，token 不进 shell history）
+cd /storage/emulated/0/编程/DeepSeek-Hermes/插件/dsh-termux-bridge
+echo "<你的token>" | bash scripts/push-with-token.sh
+
+# 也可以：GH_TOKEN=xxx bash scripts/push-with-token.sh [owner] [name] [--private]
 ```
 
+它做的事：
+
+1. `GET /user` 校验 token 并认出 login（不传 owner 时就用它）；
+2. `GET /repos/{o}/{r}` 探仓库是否已存在，不存在才 `POST /user/repos` 创建（description / homepage 一次写好）；
+3. `git push` 时用**一次性 credential helper** 从环境传 token —— **不写进 `.git/config`、
+   也不把 token 拼进 remote URL**，所以 `git remote -v`、`ps`、`.git/config` 里都看不到它；
+4. `PUT /repos/{o}/{r}/topics` 逐个补 8 个 topic。
+
+> 附带一条给自动化脚本的坑：device flow 的正确端点是 
+> `POST https://github.com/login/device/code`，写成 `/login/oauth/device/code` 会返回 **422**。
+> 拿到 `user_code` 后轮询 `POST https://github.com/login/oauth/access_token`
+> （`grant_type=urn:ietf:params:oauth:grant-type:device_code`），
+> `authorization_pending` 是正常中间态，`slow_down` 就把间隔 +5 秒。
 
 **共享存储上 git 的两个坑**
 

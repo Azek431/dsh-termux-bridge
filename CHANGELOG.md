@@ -2,6 +2,28 @@
 
 本项目遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [1.2.4] —— 2026-10-26
+
+### 新增
+
+- `scripts/push-with-token.sh`：**零交互**发布路径。只依赖 `curl` + `git`，
+  连 `gh` 都不需要，不读 TTY、不问任何问题。token 从 `GH_TOKEN` / `GITHUB_TOKEN` 或 stdin 读入，
+  `GET /user` 校验并认出 login；仓库不存在才建仓；`git push` 用**一次性 credential helper**
+  从环境传 token（不写进 `.git/config`、不拼进 remote URL），最后补 8 个 topic。
+
+### 修复（认知）
+
+- **推翻上一版对卡死的归因**。死代理确实存在、确实是隐患，但它**不是** `gh auth login` 卡住的
+  根本原因：用户清空全部代理变量、四个候选端口全 closed、`curl https://github.com` 返回 200 之后，
+  `gh auth login` 依然停在原地。
+- 实测证明网络与 device flow 本身完全可用：`POST https://github.com/login/device/code` 返回 HTTP/2 200，
+  `user_code` 正常生成，`expires_in 899 / interval 5`；轮询
+  `POST https://github.com/login/oauth/access_token` 稳定返回 `authorization_pending`。
+  真正卡住的是 `gh` 的**终端交互层**（同一 TTY 内读回车 → 切前台开浏览器 → 再读回结果）。
+  结论写进 README 第 9 节：代理清了、端口 closed、curl 200 却还不动 ⇒ 不是网络问题，直接换 token 路径。
+- 记录端点坑：device flow 是 `POST /login/device/code`，写成 `/login/oauth/device/code` 返回 **422**。
+- README「一条命令」代码块下方加醒目提示，卡住时直接跳到零交互路径，不必在 `gh` 上反复重试。
+
 ## [1.2.3] —— 2026-10-26
 
 ### 新增
